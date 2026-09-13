@@ -2547,14 +2547,18 @@ def broker_tracker_table(net_pivot: pd.DataFrame, price_df: pd.DataFrame, catego
 
     df = pd.DataFrame(rows).sort_values("delta", ascending=False)
 
-    # Gauge Big Dist <-> Big Acc: delta bersih broker BIG MONEY saja,
-    # dinormalisasi ke total |net| Big Money supaya berada di rentang wajar.
-    big_rows = df[df["kategori"] == "BIG MONEY"]
+    # Gauge Big Dist <-> Big Acc: delta bersih broker "pemain besar" (BIG
+    # MONEY + FOREIGN -- keduanya bukan ritel, lawannya sama-sama ritel),
+    # dinormalisasi ke total |net| mereka. Sebelumnya cuma menghitung BIG
+    # MONEY saja: kalau top broker di window ini semua terklasifikasi
+    # FOREIGN (umum terjadi -- lihat catatan build_broker_category_map),
+    # gauge selalu 0% padahal bukan berarti netral, cuma tidak ada sampel.
+    big_rows = df[df["kategori"].isin(["BIG MONEY", "FOREIGN"])]
     if not big_rows.empty:
         total_abs = (big_rows["alpha"].abs() + big_rows["beta"].abs()).sum()
         gauge_score = (big_rows["delta"].sum() / total_abs * 100) if total_abs else 0.0
     else:
-        gauge_score = 0.0
+        gauge_score = None  # None = tidak ada sampel, BEDA dari 0.0 = netral
 
     return df, gauge_score
 
@@ -2906,7 +2910,13 @@ if mode == "Analisis Satu Saham":
                         net_pivot, price_df, category_map, (a_from, a_to), (b_from, b_to)
                     )
                     if not tracker_df.empty:
-                        st.pyplot(plot_dist_acc_gauge(gauge_score), use_container_width=True)
+                        if gauge_score is not None:
+                            st.pyplot(plot_dist_acc_gauge(gauge_score), use_container_width=True)
+                        else:
+                            st.caption(
+                                "⚠️ Tidak ada broker kategori Big Money/Foreign di top broker "
+                                "window ini — gauge tidak ditampilkan (bukan berarti netral 0%)."
+                            )
                         disp = tracker_df.copy()
                         for c in ["alpha", "beta", "delta"]:
                             disp[c] = disp[c].apply(id_number)
@@ -2914,8 +2924,8 @@ if mode == "Analisis Satu Saham":
                         st.dataframe(disp, use_container_width=True, hide_index=True)
                         st.caption(
                             "Gauge Big Dist↔Big Acc dihitung dari delta net broker kategori "
-                            "'Big Money' saja, dinormalisasi ke total |net| mereka — proxy, "
-                            "bukan skor resmi bursa."
+                            "'Big Money' + 'Foreign' (sama-sama bukan ritel), dinormalisasi ke "
+                            "total |net| mereka — proxy, bukan skor resmi bursa."
                         )
                     else:
                         st.caption("Tidak cukup data broker di kedua rentang untuk perbandingan.")

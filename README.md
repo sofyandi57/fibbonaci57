@@ -103,6 +103,16 @@ jika secrets Supabase ada → dipakai; jika tidak → fallback SQLite lokal.
      payload    TEXT,
      fetched_at TEXT
    );
+
+   CREATE TABLE watchlist (
+     id           BIGSERIAL PRIMARY KEY,
+     code         TEXT NOT NULL,
+     added_at     TEXT NOT NULL,
+     entry_price  REAL,
+     target_price REAL,
+     stop_loss    REAL,
+     notes        TEXT
+   );
    ```
 3. Ambil kredensial di **Settings → API**:
    - `Project URL` → masukkan sebagai `SUPABASE_URL`

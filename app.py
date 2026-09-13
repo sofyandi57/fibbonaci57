@@ -217,6 +217,17 @@ def db_init():
                    fetched_at TEXT
                )"""
         )
+        con.execute(
+            """CREATE TABLE IF NOT EXISTS watchlist (
+                   id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                   code         TEXT NOT NULL,
+                   added_at     TEXT NOT NULL,
+                   entry_price  REAL,
+                   target_price REAL,
+                   stop_loss    REAL,
+                   notes        TEXT
+               )"""
+        )
 
 
 db_init()
@@ -290,6 +301,53 @@ def db_set_kv(key: str, payload: str, fetched_at: str):
             "INSERT OR REPLACE INTO kv_cache (key, payload, fetched_at) "
             "VALUES (?,?,?)", (key, payload, fetched_at),
         )
+
+
+# ---------- dispatcher: watchlist ----------
+def watchlist_add(code: str, entry_price: float, target_price: float | None,
+                   stop_loss: float | None, notes: str = ""):
+    added_at = _wib_now().isoformat()
+    if _use_supabase():
+        url = f"{st.secrets['SUPABASE_URL']}/rest/v1/watchlist"
+        row = {"code": code, "added_at": added_at, "entry_price": entry_price,
+               "target_price": target_price, "stop_loss": stop_loss, "notes": notes}
+        r = requests.post(url, headers=_sb_headers(), json=[row], timeout=30)
+        r.raise_for_status()
+        return
+    with db_conn() as con:
+        con.execute(
+            "INSERT INTO watchlist (code, added_at, entry_price, target_price, stop_loss, notes) "
+            "VALUES (?,?,?,?,?,?)",
+            (code, added_at, entry_price, target_price, stop_loss, notes),
+        )
+
+
+def watchlist_list() -> pd.DataFrame:
+    if _use_supabase():
+        url = f"{st.secrets['SUPABASE_URL']}/rest/v1/watchlist"
+        try:
+            r = requests.get(url, headers=_sb_headers(),
+                              params={"order": "added_at.desc"}, timeout=30)
+        except requests.RequestException:
+            return pd.DataFrame()
+        if r.status_code != 200:
+            return pd.DataFrame()
+        rows = r.json()
+    else:
+        with db_conn() as con:
+            df = pd.read_sql_query("SELECT * FROM watchlist ORDER BY added_at DESC", con)
+        return df
+    df = pd.DataFrame(rows)
+    return df
+
+
+def watchlist_delete(entry_id):
+    if _use_supabase():
+        url = f"{st.secrets['SUPABASE_URL']}/rest/v1/watchlist"
+        requests.delete(url, headers=_sb_headers(), params={"id": f"eq.{entry_id}"}, timeout=30)
+        return
+    with db_conn() as con:
+        con.execute("DELETE FROM watchlist WHERE id = ?", (entry_id,))
 
 
 # ---------- dispatcher: bdm ----------
@@ -2527,7 +2585,7 @@ with st.sidebar:
     mode = st.radio(
         "Mode",
         ["Analisis Satu Saham", "Screener Multi-Saham", "Screener Bandar",
-         "Broker Activity", "Outlook Pasar"],
+         "Broker Activity", "Outlook Pasar", "⭐ Watchlist"],
     )
     lookback = st.slider("Lookback (hari)", 60, 365, 200)
     max_risk = st.slider("Batas risiko maksimum (%)", 3, 15, 8)
@@ -3691,6 +3749,98 @@ elif mode == "Outlook Pasar":
         st.error(f"❌ Notasi khusus gagal diambil: {notations_err}")
     else:
         st.caption("Tidak ada saham dengan notasi khusus saat ini.")
+
+# ==========================================================================
+# MODE 6 — WATCHLIST
+# ==========================================================================
+elif mode == "⭐ Watchlist":
+    st.subheader("⭐ Watchlist Saya")
+    st.caption(
+        "Saham yang sedang diincar, dengan target harga & stop loss sendiri. "
+        "Tersimpan permanen (Supabase/SQLite) — tidak hilang saat redeploy."
+    )
+
+    with st.form("watchlist_add_form", clear_on_submit=True):
+        st.markdown("**➕ Tambah ke Watchlist**")
+        wc1, wc2, wc3 = st.columns(3)
+        wl_ticker = wc1.text_input("Kode Saham").upper().strip()
+        wl_target = wc2.number_input("Target Harga", min_value=0.0, step=1.0, format="%.2f")
+        wl_sl = wc3.number_input("Target Stop Loss", min_value=0.0, step=1.0, format="%.2f")
+        wl_notes = st.text_area("Catatan (opsional)", height=60)
+        submitted = st.form_submit_button("Tambahkan", type="primary")
+
+        if submitted:
+            if not wl_ticker:
+                st.warning("Kode saham wajib diisi.")
+            else:
+                df_wl = fetch_daily_chart(wl_ticker, 10)
+                if df_wl is None or df_wl.empty:
+                    st.error(f"Gagal ambil harga {wl_ticker} — cek kode saham / API key.")
+                else:
+                    entry_price = float(df_wl["close"].iloc[-1])
+                    watchlist_add(
+                        wl_ticker, entry_price,
+                        wl_target if wl_target > 0 else None,
+                        wl_sl if wl_sl > 0 else None,
+                        wl_notes,
+                    )
+                    st.success(f"{wl_ticker} ditambahkan ke watchlist @ {id_number(entry_price)}.")
+                    st.rerun()
+
+    st.divider()
+    st.markdown("**📋 Daftar Watchlist**")
+    wl_df = watchlist_list()
+
+    if wl_df.empty:
+        st.info("Watchlist masih kosong — tambahkan saham lewat form di atas.")
+    else:
+        rows_display = []
+        for _, row in wl_df.iterrows():
+            code = row["code"]
+            df_live = fetch_daily_chart(code, 5)
+            current_price = float(df_live["close"].iloc[-1]) if df_live is not None and not df_live.empty else None
+            entry_price = row.get("entry_price")
+            gain_pct = ((current_price - entry_price) / entry_price * 100) if current_price and entry_price else None
+
+            target = row.get("target_price")
+            sl = row.get("stop_loss")
+            status = "ON TRACK"
+            if current_price and target and current_price >= target:
+                status = "🎯 TARGET TERCAPAI"
+            elif current_price and sl and current_price <= sl:
+                status = "⛔ STOP LOSS TERKENA"
+
+            added_at_raw = row.get("added_at", "")
+            try:
+                added_dt = _dt.fromisoformat(str(added_at_raw))
+                added_str = added_dt.strftime("%d/%m/%Y %H:%M")
+            except (ValueError, TypeError):
+                added_str = str(added_at_raw)
+
+            rows_display.append({
+                "id": row.get("id"),
+                "Kode": code,
+                "Ditambahkan": added_str,
+                "Entry": id_number(entry_price) if entry_price else "-",
+                "Harga Saat Ini": id_number(current_price) if current_price else "-",
+                "Gain%": f"{gain_pct:+.2f}%" if gain_pct is not None else "-",
+                "Target": id_number(target) if target else "-",
+                "Stop Loss": id_number(sl) if sl else "-",
+                "Status": status,
+                "Catatan": row.get("notes") or "-",
+            })
+
+        disp_df = pd.DataFrame(rows_display)
+        st.dataframe(disp_df.drop(columns=["id"]), use_container_width=True, hide_index=True)
+
+        st.markdown("**🗑️ Hapus dari Watchlist**")
+        del_col1, del_col2 = st.columns([3, 1])
+        options = {f"{r['Kode']} (ditambahkan {r['Ditambahkan']})": r["id"] for r in rows_display}
+        to_delete_label = del_col1.selectbox("Pilih entri", list(options.keys()))
+        if del_col2.button("Hapus", use_container_width=True):
+            watchlist_delete(options[to_delete_label])
+            st.success("Entri dihapus.")
+            st.rerun()
 
 # --------------------------------------------------------------------------
 with st.expander("ℹ️ Cara membaca"):

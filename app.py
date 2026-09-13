@@ -19,6 +19,7 @@ Disclaimer: aplikasi ini untuk EDUKASI, bukan rekomendasi beli/jual.
 
 import io
 import os
+import re
 import sqlite3
 import time
 from datetime import date, timedelta
@@ -33,22 +34,20 @@ import streamlit as st
 # --------------------------------------------------------------------------
 BASE_URL = "https://api.invezgo.com"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL_DEFAULT = "llama-3.1-8b-instant"
-# Urutan model yang dicoba otomatis kalau model utama 404/decommissioned.
-# Model yang tersedia berubah-ubah di sisi Groq, jadi app auto-rotate
-# ke kandidat berikutnya alih-alih langsung gagal.
-GROQ_MODEL_CANDIDATES = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "llama3-70b-8192",
-    "llama3-8b-8192",
-    "gemma2-9b-it",
-    "mixtral-8x7b-32768",
-    "openai/gpt-oss-120b",
-    "openai/gpt-oss-20b",
-    "qwen/qwen3-32b",
-    "moonshotai/kimi-k2-instruct",
-]
+GROQ_MODEL_DEFAULT = "openai/gpt-oss-120b"
+# Fallback singkat & dikurasi (BUKAN daftar tebak-tebakan semua nama model
+# Groq) -- limit Groq itu per-model per-organisasi, jadi kalau satu model
+# kena rate limit/quota harian/decommissioned, model lain di daftar ini
+# biasanya masih longgar. Urutan dari yang paling mirip kualitasnya ke
+# model utama.
+GROQ_FALLBACK_MODELS = ["openai/gpt-oss-20b", "qwen/qwen3-32b", "llama-3.1-8b-instant"]
+# Model gpt-oss & qwen3 adalah REASONING model -- diam-diam memakai sebagian
+# max_tokens untuk "reasoning_tokens" (chain-of-thought internal) SEBELUM
+# menulis jawaban asli. Tanpa reasoning_effort="low", jawaban bisa terpotong
+# kosong karena max_tokens habis semua buat reasoning.
+GROQ_REASONING_MODELS = {"openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3-32b"}
+RATE_LIMIT_MAX_RETRIES = 3
+RATE_LIMIT_BASE_DELAY_SECONDS = 6
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fib_cache.db")
 
 FIB_LEVELS = [0.0, 0.382, 0.5, 0.618, 0.786, 1.0]
@@ -514,7 +513,7 @@ def broker_top3_accumulate(summary: pd.DataFrame):
 # --------------------------------------------------------------------------
 def _groq_model_order() -> list:
     """Urutan model dicoba: override secrets dulu, lalu model terakhir yang
-    terbukti jalan di sesi ini, lalu daftar kandidat bawaan (tanpa duplikat)."""
+    terbukti jalan di sesi ini, lalu default + fallback bawaan (tanpa duplikat)."""
     order = []
     try:
         override = st.secrets.get("GROQ_MODEL")
@@ -525,7 +524,7 @@ def _groq_model_order() -> list:
     last_working = st.session_state.get("groq_last_working_model")
     if last_working:
         order.append(last_working)
-    order += GROQ_MODEL_CANDIDATES
+    order += [GROQ_MODEL_DEFAULT] + GROQ_FALLBACK_MODELS
     seen, dedup = set(), []
     for m in order:
         if m not in seen:
@@ -535,41 +534,65 @@ def _groq_model_order() -> list:
 
 
 def _groq_call(key: str, model: str, prompt: str):
-    """Satu percobaan panggilan Groq. Return (status, text_or_content)."""
+    """Satu percobaan panggilan Groq. Return (status, text_or_content, retry_after)."""
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Kamu adalah analis teknikal saham IDX berpengalaman. "
+                    "Jawab dalam Bahasa Indonesia, ringkas namun substantif "
+                    "(maks ~400 kata). Selalu tutup dengan pengingat bahwa "
+                    "analisis bersifat edukasi, bukan rekomendasi beli/jual."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.4,
+        "max_tokens": 900,
+    }
+    if model in GROQ_REASONING_MODELS:
+        payload["reasoning_effort"] = "low"
+
     r = requests.post(
         GROQ_URL,
         headers={"Authorization": f"Bearer {key}"},
-        json={
-            "model": model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "Kamu adalah analis teknikal saham IDX berpengalaman. "
-                        "Jawab dalam Bahasa Indonesia, ringkas namun substantif "
-                        "(maks ~400 kata). Selalu tutup dengan pengingat bahwa "
-                        "analisis bersifat edukasi, bukan rekomendasi beli/jual."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.4,
-            "max_tokens": 900,
-        },
+        json=payload,
         timeout=90,
         allow_redirects=False,
     )
     if r.is_redirect or r.status_code in (301, 302, 303, 307, 308):
-        return "redirect", r.headers.get("Location", "?")
+        return "redirect", r.headers.get("Location", "?"), None
     if r.status_code == 401:
-        return "auth", None
+        return "auth", None, None
     if r.status_code == 404:
-        return "not_found", r.text
+        return "not_found", r.text, None
     if r.status_code == 429:
-        return "rate_limit", None
+        body = r.text.lower()
+        # TPD (token per hari) baru reset dalam jam, retry pendek tidak
+        # membantu -> pindah model lain segera. TPM (token per menit) itu
+        # rolling/leaky bucket, pulih dalam hitungan detik -> retry singkat.
+        kind = "daily_quota" if ("tokens per day" in body or "(tpd)" in body) else "rate_limit"
+        return kind, r.text, _extract_retry_wait(r.text)
     if not r.ok:
-        return "error", f"{r.status_code}: {r.text}"
-    return "ok", r.json()["choices"][0]["message"]["content"]
+        return "error", f"{r.status_code}: {r.text}", None
+    return "ok", r.json()["choices"][0]["message"]["content"], None
+
+
+def _extract_retry_wait(text: str) -> str | None:
+    """Cari perkiraan waktu tunggu dari pesan Groq, mis. 'try again in 8m30.624s'."""
+    match = re.search(r"try again in\s+(?:(\d+(?:\.\d+)?)m(?!s))?(?:(\d+(?:\.\d+)?)s)?", text, re.IGNORECASE)
+    if not match or not (match.group(1) or match.group(2)):
+        return None
+    minutes = round(float(match.group(1))) if match.group(1) else 0
+    seconds = round(float(match.group(2))) if match.group(2) else 0
+    parts = []
+    if minutes:
+        parts.append(f"{minutes} menit")
+    if seconds:
+        parts.append(f"{seconds} detik")
+    return " ".join(parts) or "beberapa detik"
 
 
 @st.cache_data(ttl=1800, show_spinner="🤖 Groq sedang menganalisis…")
@@ -578,27 +601,33 @@ def groq_chat(prompt: str) -> str:
     tried, not_found = [], []
 
     for model in _groq_model_order():
-        status, payload = _groq_call(key, model, prompt)
         tried.append(model)
 
-        if status == "ok":
-            st.session_state["groq_last_working_model"] = model
-            return payload
-        if status == "auth":
-            return "❌ GROQ_API_KEY tidak valid."
-        if status == "redirect":
-            return (
-                f"❌ Groq redirect ke '{payload}' — permintaan POST berubah jadi "
-                "GET dan gagal. Cek GROQ_URL sudah benar-benar "
-                "'https://api.groq.com/openai/v1/chat/completions'."
-            )
-        if status == "not_found":
-            not_found.append(model)
-            continue  # auto-rotate ke kandidat berikutnya
-        if status == "rate_limit":
-            continue  # coba model lain, bukan nyerah
-        if status == "error":
-            continue  # error lain, tetap coba kandidat berikutnya
+        for attempt in range(RATE_LIMIT_MAX_RETRIES):
+            status, payload, wait_hint = _groq_call(key, model, prompt)
+
+            if status == "ok":
+                st.session_state["groq_last_working_model"] = model
+                return payload
+            if status == "auth":
+                return "❌ GROQ_API_KEY tidak valid."
+            if status == "redirect":
+                return (
+                    f"❌ Groq redirect ke '{payload}' — permintaan POST berubah jadi "
+                    "GET dan gagal. Cek GROQ_URL sudah benar-benar "
+                    "'https://api.groq.com/openai/v1/chat/completions'."
+                )
+            if status == "not_found":
+                not_found.append(model)
+                break  # jangan retry model yang tidak ada, langsung ke kandidat berikutnya
+            if status == "daily_quota":
+                break  # tidak akan pulih dalam hitungan detik, pindah model lain segera
+            if status == "rate_limit":
+                if attempt < RATE_LIMIT_MAX_RETRIES - 1:
+                    time.sleep(RATE_LIMIT_BASE_DELAY_SECONDS * (attempt + 1))
+                    continue
+                break  # retry TPM habis di model ini, coba kandidat berikutnya
+            break  # error lain -> tetap coba kandidat berikutnya, jangan retry model sama
 
     return (
         f"❌ Semua {len(tried)} model Groq yang dicoba gagal ({', '.join(tried)}). "

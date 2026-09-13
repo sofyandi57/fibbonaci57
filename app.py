@@ -454,6 +454,127 @@ def fetch_stock_list():
 
 
 # --------------------------------------------------------------------------
+# OUTLOOK PASAR: index chart (IHSG), rotasi sektor, notasi khusus market-wide
+# Ide diadopsi dari modul "Outlook IHSG"/"Siklus Sektor"/"Suspensi" milik
+# Gigantum, dibangun ulang dari endpoint InvezGo yang sudah diverifikasi ke
+# api-1.json -- BUKAN astrologi finansial/moon phase (skill/laporan sumber
+# ide ini sendiri mengkritiknya sebagai pseudo-sains dicampur setara dengan
+# data teknikal, dan endpoint semacam itu memang tidak ada di InvezGo).
+# --------------------------------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_index_chart(code: str, days: int = 90):
+    """OHLCV index (IHSG/LQ45/sektor). Endpoint: GET /analysis/chart/index/{code}."""
+    frm = (date.today() - timedelta(days=days)).isoformat()
+    to = date.today().isoformat()
+    api_key = get_secret("INVEZGO_API_KEY")
+    try:
+        r = requests.get(
+            f"{BASE_URL}/analysis/chart/index/{code}",
+            params={"from": frm, "to": to},
+            headers={"Authorization": f"Bearer {api_key}"}, timeout=30,
+        )
+    except requests.RequestException:
+        return None
+    if not r.ok:
+        return None
+    data = r.json()
+    if not data:
+        return None
+    df = pd.DataFrame(data)
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.sort_values("date").reset_index(drop=True)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_sector_rotation(days: int = 20):
+    """
+    Rotasi sektor gaya RRG (Relative Rotation Graph): posisi tiap sektor di
+    kuadran leading/weakening/lagging/improving relatif ke benchmark IHSG.
+    Endpoint: GET /analysis/sector/rotation.
+    """
+    frm = (date.today() - timedelta(days=days)).isoformat()
+    to = date.today().isoformat()
+    api_key = get_secret("INVEZGO_API_KEY")
+    try:
+        r = requests.get(
+            f"{BASE_URL}/analysis/sector/rotation",
+            params={"from": frm, "to": to, "base": "COMPOSITE"},
+            headers={"Authorization": f"Bearer {api_key}"}, timeout=30,
+        )
+    except requests.RequestException:
+        return None
+    if not r.ok:
+        return None
+    data = r.json()
+    if not data or not data.get("data"):
+        return None
+    return data
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_market_notations():
+    """
+    Daftar saham dengan notasi khusus (mis. UMA, potensi pailit, dll) di
+    seluruh pasar -- proxy untuk daftar "saham dalam pengawasan", lebih
+    luas cakupannya dari sekadar status suspensi murni.
+    Endpoint: GET /analysis/notation.
+    """
+    api_key = get_secret("INVEZGO_API_KEY")
+    try:
+        r = requests.get(
+            f"{BASE_URL}/analysis/notation",
+            headers={"Authorization": f"Bearer {api_key}"}, timeout=30,
+        )
+    except requests.RequestException:
+        return None
+    if not r.ok:
+        return None
+    data = r.json()
+    if not data:
+        return None
+    rows = []
+    for item in data:
+        code = item.get("code")
+        item_date = item.get("date")
+        for n in item.get("list", []):
+            rows.append({"code": code, "date": item_date, "notasi": n.get("notation"),
+                         "keterangan": n.get("description")})
+    return pd.DataFrame(rows) if rows else None
+
+
+def plot_sector_rotation(data: dict):
+    """Scatter RRG: tiap sektor sebagai titik terakhir + jejak (trail), diwarnai per kuadran."""
+    quadrant_colors = {
+        "leading": "#2ecc71", "weakening": "#f39c12",
+        "lagging": "#e74c3c", "improving": "#3498db",
+    }
+    fig, ax = plt.subplots(figsize=(9, 8))
+    ax.axhline(100, color="#999", lw=1)
+    ax.axvline(100, color="#999", lw=1)
+    for sector in data.get("data", []):
+        trail = sector.get("trail", [])
+        if not trail:
+            continue
+        xs = [p["x"] for p in trail]
+        ys = [p["y"] for p in trail]
+        color = quadrant_colors.get(sector.get("quadrant"), "#999")
+        ax.plot(xs, ys, "-", color=color, alpha=0.4, lw=1)
+        ax.scatter(xs[-1], ys[-1], color=color, s=90, zorder=3)
+        ax.annotate(sector.get("code", ""), (xs[-1], ys[-1]),
+                    textcoords="offset points", xytext=(6, 6), fontsize=8)
+    ax.set_xlabel("Kekuatan Relatif vs Benchmark")
+    ax.set_ylabel("Momentum")
+    ax.set_title(f"Rotasi Sektor vs {data.get('benchmark', 'COMPOSITE')} (per {data.get('lastDate', '-')})")
+    handles = [plt.Line2D([0], [0], marker="o", color="w", markerfacecolor=c, markersize=8, label=k.capitalize())
+               for k, c in quadrant_colors.items()]
+    ax.legend(handles=handles, loc="upper left", fontsize=8)
+    ax.grid(alpha=0.2)
+    return fig
+
+
+# --------------------------------------------------------------------------
 # BROKER SUMMARY (top-3 akumulasi: broker #1 >= 2x broker #2)
 # --------------------------------------------------------------------------
 from datetime import datetime as _dt
@@ -1762,7 +1883,7 @@ with st.sidebar:
     st.header("⚙️ Pengaturan")
     mode = st.radio(
         "Mode",
-        ["Analisis Satu Saham", "Screener Multi-Saham", "Screener Bandar"],
+        ["Analisis Satu Saham", "Screener Multi-Saham", "Screener Bandar", "Outlook Pasar"],
     )
     lookback = st.slider("Lookback (hari)", 60, 365, 200)
     max_risk = st.slider("Batas risiko maksimum (%)", 3, 15, 8)
@@ -2332,7 +2453,7 @@ elif mode == "Screener Multi-Saham":
 # ==========================================================================
 # MODE 3 — SCREENER BANDAR (AKUMULASI / DISTRIBUSI)
 # ==========================================================================
-else:
+elif mode == "Screener Bandar":
     st.subheader("🕵️ Screener Bandarmologi: Akumulasi vs Distribusi")
     st.markdown(
         """
@@ -2483,6 +2604,72 @@ else:
                 st.markdown(groq_chat(prompt))
             except Exception as e:
                 st.error(f"Groq error: {e}")
+
+# ==========================================================================
+# MODE 4 — OUTLOOK PASAR (IHSG, rotasi sektor, notasi khusus market-wide)
+# ==========================================================================
+elif mode == "Outlook Pasar":
+    st.subheader("🌐 Outlook Pasar")
+    st.caption(
+        "Ringkasan kondisi pasar secara umum — bukan analisis per-saham. "
+        "Data harga & rotasi sektor murni kuantitatif; tidak ada astrologi "
+        "atau sinyal non-verifiable lain dicampur ke dalamnya."
+    )
+
+    st.markdown("### 📊 Indeks Harga Saham Gabungan (IHSG)")
+    idx_days = st.slider("Rentang hari IHSG", 30, 365, 90)
+    idx_df = fetch_index_chart("COMPOSITE", idx_days)
+    if idx_df is not None and not idx_df.empty:
+        last_close = float(idx_df["close"].iloc[-1])
+        prev_close = float(idx_df["close"].iloc[-2]) if len(idx_df) > 1 else last_close
+        chg_pct = (last_close - prev_close) / prev_close * 100 if prev_close else 0
+        ma20 = float(idx_df["close"].tail(20).mean()) if len(idx_df) >= 20 else last_close
+        trend = "DI ATAS MA20" if last_close > ma20 else "DI BAWAH MA20"
+
+        i1, i2, i3 = st.columns(3)
+        i1.metric("IHSG Terakhir", id_number(last_close, 2), delta=f"{chg_pct:+.2f}%")
+        i2.metric("MA20", id_number(ma20, 2))
+        i3.metric("Posisi vs MA20", trend)
+
+        fig, ax = plt.subplots(figsize=(12, 4.5))
+        ax.plot(idx_df["date"], idx_df["close"], color="#1f4fd8", lw=1.5, label="Close IHSG")
+        ax.plot(idx_df["date"], idx_df["close"].rolling(20).mean(), color="#e74c3c", lw=1, ls="--", label="MA20")
+        ax.set_title(f"IHSG {idx_days} Hari Terakhir")
+        ax.legend(fontsize=8)
+        ax.grid(alpha=0.2)
+        fig.autofmt_xdate()
+        st.pyplot(fig, use_container_width=True)
+    else:
+        st.warning("Data IHSG tidak tersedia — cek API key / paket langganan.")
+
+    st.markdown("### 🔄 Rotasi Sektor (RRG)")
+    st.caption(
+        "Kuadran: **Leading** (kuat & momentum naik), **Weakening** (kuat tapi "
+        "momentum melemah), **Lagging** (lemah & momentum turun), **Improving** "
+        "(lemah tapi mulai membaik) — relatif terhadap IHSG."
+    )
+    rotation_data = fetch_sector_rotation()
+    if rotation_data:
+        st.pyplot(plot_sector_rotation(rotation_data), use_container_width=True)
+        quad_rows = [
+            {"Sektor": s.get("name", s.get("code")), "Kode": s.get("code"), "Kuadran": s.get("quadrant")}
+            for s in rotation_data.get("data", [])
+        ]
+        st.dataframe(pd.DataFrame(quad_rows), use_container_width=True, hide_index=True)
+    else:
+        st.warning("Data rotasi sektor tidak tersedia — cek API key / paket langganan.")
+
+    st.markdown("### ⚠️ Saham dengan Notasi Khusus (Watchlist)")
+    st.caption(
+        "Daftar saham yang sedang punya notasi khusus dari bursa (mis. UMA, "
+        "potensi pailit, dll) — bukan daftar suspensi murni, cakupannya lebih "
+        "luas (semua jenis notasi aktif)."
+    )
+    notations_df = fetch_market_notations()
+    if notations_df is not None and not notations_df.empty:
+        st.dataframe(notations_df, use_container_width=True, hide_index=True, height=350)
+    else:
+        st.caption("Tidak ada data notasi khusus saat ini, atau endpoint butuh paket tertentu.")
 
 # --------------------------------------------------------------------------
 with st.expander("ℹ️ Cara membaca"):

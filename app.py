@@ -461,56 +461,75 @@ def fetch_stock_list():
 # ide ini sendiri mengkritiknya sebagai pseudo-sains dicampur setara dengan
 # data teknikal, dan endpoint semacam itu memang tidak ada di InvezGo).
 # --------------------------------------------------------------------------
+_STATUS_HINT = {
+    401: "401 Unauthorized — API key tidak valid.",
+    402: "402 Payment Required — endpoint ini butuh paket/langganan lebih tinggi dari yang kamu punya.",
+    404: "404 Not Found — path endpoint kemungkinan salah/berbeda dari dokumentasi API.",
+    429: "429 Rate limited — coba lagi beberapa saat.",
+}
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_index_chart(code: str, days: int = 90):
-    """OHLCV index (IHSG/LQ45/sektor). Endpoint: GET /analysis/chart/index/{code}."""
+    """
+    OHLCV index (IHSG/LQ45/sektor). Endpoint: GET /analysis/chart/index/{code}.
+    Return (df_or_None, error_message_or_None) -- error selalu diteruskan
+    ke UI, bukan ditelan diam-diam jadi "tidak tersedia" generik.
+    """
     frm = (date.today() - timedelta(days=days)).isoformat()
     to = date.today().isoformat()
     api_key = get_secret("INVEZGO_API_KEY")
+    url = f"{BASE_URL}/analysis/chart/index/{code}"
     try:
-        r = requests.get(
-            f"{BASE_URL}/analysis/chart/index/{code}",
-            params={"from": frm, "to": to},
-            headers={"Authorization": f"Bearer {api_key}"}, timeout=30,
-        )
-    except requests.RequestException:
-        return None
+        r = requests.get(url, params={"from": frm, "to": to},
+                          headers={"Authorization": f"Bearer {api_key}"}, timeout=30)
+    except requests.RequestException as e:
+        return None, f"Request error: {e}"
+    if r.status_code == 204:
+        return None, None
     if not r.ok:
-        return None
+        hint = _STATUS_HINT.get(r.status_code, f"{r.status_code}")
+        return None, f"GET {url} -> {hint} | body: {r.text[:300]}"
     data = r.json()
     if not data:
-        return None
+        return None, None
     df = pd.DataFrame(data)
     df["date"] = pd.to_datetime(df["date"]).dt.date
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df.sort_values("date").reset_index(drop=True)
+    return df.sort_values("date").reset_index(drop=True), None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_sector_rotation(days: int = 20):
+def fetch_sector_rotation(days: int = 90):
     """
     Rotasi sektor gaya RRG (Relative Rotation Graph): posisi tiap sektor di
     kuadran leading/weakening/lagging/improving relatif ke benchmark IHSG.
-    Endpoint: GET /analysis/sector/rotation.
+    Endpoint: GET /analysis/sector/rotation -- from/to WAJIB (bukan opsional).
+    interval=weekly (default API) + tail=8 butuh histori >=8 minggu, jadi
+    window default dinaikkan ke 90 hari (bukan 20) supaya trail tidak kosong.
     """
     frm = (date.today() - timedelta(days=days)).isoformat()
     to = date.today().isoformat()
     api_key = get_secret("INVEZGO_API_KEY")
+    url = f"{BASE_URL}/analysis/sector/rotation"
     try:
         r = requests.get(
-            f"{BASE_URL}/analysis/sector/rotation",
-            params={"from": frm, "to": to, "base": "COMPOSITE"},
+            url,
+            params={"from": frm, "to": to, "base": "COMPOSITE", "interval": "weekly", "tail": 8},
             headers={"Authorization": f"Bearer {api_key}"}, timeout=30,
         )
-    except requests.RequestException:
-        return None
+    except requests.RequestException as e:
+        return None, f"Request error: {e}"
+    if r.status_code == 204:
+        return None, None
     if not r.ok:
-        return None
+        hint = _STATUS_HINT.get(r.status_code, f"{r.status_code}")
+        return None, f"GET {url} -> {hint} | body: {r.text[:300]}"
     data = r.json()
     if not data or not data.get("data"):
-        return None
-    return data
+        return None, None
+    return data, None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -520,20 +539,22 @@ def fetch_market_notations():
     seluruh pasar -- proxy untuk daftar "saham dalam pengawasan", lebih
     luas cakupannya dari sekadar status suspensi murni.
     Endpoint: GET /analysis/notation.
+    Return (df_or_None, error_message_or_None).
     """
     api_key = get_secret("INVEZGO_API_KEY")
+    url = f"{BASE_URL}/analysis/notation"
     try:
-        r = requests.get(
-            f"{BASE_URL}/analysis/notation",
-            headers={"Authorization": f"Bearer {api_key}"}, timeout=30,
-        )
-    except requests.RequestException:
-        return None
+        r = requests.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=30)
+    except requests.RequestException as e:
+        return None, f"Request error: {e}"
+    if r.status_code == 204:
+        return None, None
     if not r.ok:
-        return None
+        hint = _STATUS_HINT.get(r.status_code, f"{r.status_code}")
+        return None, f"GET {url} -> {hint} | body: {r.text[:300]}"
     data = r.json()
     if not data:
-        return None
+        return None, None
     rows = []
     for item in data:
         code = item.get("code")
@@ -541,7 +562,7 @@ def fetch_market_notations():
         for n in item.get("list", []):
             rows.append({"code": code, "date": item_date, "notasi": n.get("notation"),
                          "keterangan": n.get("description")})
-    return pd.DataFrame(rows) if rows else None
+    return (pd.DataFrame(rows), None) if rows else (None, None)
 
 
 def plot_sector_rotation(data: dict):
@@ -644,14 +665,6 @@ def fetch_broker_summary(code: str, window: int):
 # --------------------------------------------------------------------------
 SHAREHOLDER_CACHE_TTL_HOURS = 24  # komposisi kepemilikan terbit bulanan, tidak perlu re-fetch tiap hari
 INSIDER_LOOKBACK_MONTHS = 18
-
-
-_STATUS_HINT = {
-    401: "401 Unauthorized — API key tidak valid.",
-    402: "402 Payment Required — endpoint ini butuh paket/langganan lebih tinggi dari yang kamu punya.",
-    404: "404 Not Found — path endpoint kemungkinan salah/berbeda dari dokumentasi API.",
-    429: "429 Rate limited — coba lagi beberapa saat.",
-}
 
 
 def fetch_shareholders(code: str):
@@ -2618,7 +2631,7 @@ elif mode == "Outlook Pasar":
 
     st.markdown("### 📊 Indeks Harga Saham Gabungan (IHSG)")
     idx_days = st.slider("Rentang hari IHSG", 30, 365, 90)
-    idx_df = fetch_index_chart("COMPOSITE", idx_days)
+    idx_df, idx_err = fetch_index_chart("COMPOSITE", idx_days)
     if idx_df is not None and not idx_df.empty:
         last_close = float(idx_df["close"].iloc[-1])
         prev_close = float(idx_df["close"].iloc[-2]) if len(idx_df) > 1 else last_close
@@ -2639,8 +2652,10 @@ elif mode == "Outlook Pasar":
         ax.grid(alpha=0.2)
         fig.autofmt_xdate()
         st.pyplot(fig, use_container_width=True)
+    elif idx_err:
+        st.error(f"❌ IHSG gagal diambil: {idx_err}")
     else:
-        st.warning("Data IHSG tidak tersedia — cek API key / paket langganan.")
+        st.caption("Data IHSG tidak tersedia untuk rentang ini.")
 
     st.markdown("### 🔄 Rotasi Sektor (RRG)")
     st.caption(
@@ -2648,7 +2663,7 @@ elif mode == "Outlook Pasar":
         "momentum melemah), **Lagging** (lemah & momentum turun), **Improving** "
         "(lemah tapi mulai membaik) — relatif terhadap IHSG."
     )
-    rotation_data = fetch_sector_rotation()
+    rotation_data, rotation_err = fetch_sector_rotation()
     if rotation_data:
         st.pyplot(plot_sector_rotation(rotation_data), use_container_width=True)
         quad_rows = [
@@ -2656,8 +2671,10 @@ elif mode == "Outlook Pasar":
             for s in rotation_data.get("data", [])
         ]
         st.dataframe(pd.DataFrame(quad_rows), use_container_width=True, hide_index=True)
+    elif rotation_err:
+        st.error(f"❌ Rotasi sektor gagal diambil: {rotation_err}")
     else:
-        st.warning("Data rotasi sektor tidak tersedia — cek API key / paket langganan.")
+        st.caption("Data rotasi sektor kosong untuk rentang ini.")
 
     st.markdown("### ⚠️ Saham dengan Notasi Khusus (Watchlist)")
     st.caption(
@@ -2665,11 +2682,13 @@ elif mode == "Outlook Pasar":
         "potensi pailit, dll) — bukan daftar suspensi murni, cakupannya lebih "
         "luas (semua jenis notasi aktif)."
     )
-    notations_df = fetch_market_notations()
+    notations_df, notations_err = fetch_market_notations()
     if notations_df is not None and not notations_df.empty:
         st.dataframe(notations_df, use_container_width=True, hide_index=True, height=350)
+    elif notations_err:
+        st.error(f"❌ Notasi khusus gagal diambil: {notations_err}")
     else:
-        st.caption("Tidak ada data notasi khusus saat ini, atau endpoint butuh paket tertentu.")
+        st.caption("Tidak ada saham dengan notasi khusus saat ini.")
 
 # --------------------------------------------------------------------------
 with st.expander("ℹ️ Cara membaca"):

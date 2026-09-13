@@ -566,35 +566,48 @@ def fetch_index_chart(code: str, days: int = 90):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_sector_rotation(days: int = 90):
+def fetch_sector_rotation(days: int = 180):
     """
     Rotasi sektor gaya RRG (Relative Rotation Graph): posisi tiap sektor di
     kuadran leading/weakening/lagging/improving relatif ke benchmark IHSG.
     Endpoint: GET /analysis/sector/rotation -- from/to WAJIB (bukan opsional).
-    interval=weekly (default API) + tail=8 butuh histori >=8 minggu, jadi
-    window default dinaikkan ke 90 hari (bukan 20) supaya trail tidak kosong.
+
+    interval="weekly"+tail=8 yang dipaksakan sebelumnya ternyata membuat
+    'data' selalu kosong (200 OK, array kosong) -- kemungkinan endpoint
+    butuh buffer histori SEBELUM `from` untuk menghitung metrik rotasi
+    (mis. RS-Ratio butuh window `length` hari ke belakang) yang tidak
+    terpenuhi walau window 90 hari. Coba beberapa kombinasi parameter
+    berurutan (interval daily lebih dulu -- butuh buffer lebih pendek per
+    titik trail -- lalu fallback ke default API polos tanpa override sama
+    sekali) sampai ada yang mengembalikan data non-kosong.
     """
     frm = (date.today() - timedelta(days=days)).isoformat()
     to = date.today().isoformat()
     api_key = get_secret("INVEZGO_API_KEY")
     url = f"{BASE_URL}/analysis/sector/rotation"
-    try:
-        r = requests.get(
-            url,
-            params={"from": frm, "to": to, "base": "COMPOSITE", "interval": "weekly", "tail": 8},
-            headers={"Authorization": f"Bearer {api_key}"}, timeout=30,
-        )
-    except requests.RequestException as e:
-        return None, f"Request error: {e}"
-    if r.status_code == 204:
-        return None, None
-    if not r.ok:
-        hint = _STATUS_HINT.get(r.status_code, f"{r.status_code}")
-        return None, f"GET {url} -> {hint} | body: {r.text[:300]}"
-    data = r.json()
-    if not data or not data.get("data"):
-        return None, f"GET {url} -> 200 OK tapi field 'data' kosong. Body mentah: {r.text[:500]}"
-    return data, None
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    attempts = [
+        {"from": frm, "to": to, "base": "COMPOSITE", "interval": "daily", "tail": 20},
+        {"from": frm, "to": to, "base": "COMPOSITE"},  # polos, pakai default API apa adanya
+    ]
+    last_body = None
+    for params in attempts:
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=30)
+        except requests.RequestException as e:
+            return None, f"Request error: {e}"
+        if r.status_code == 204:
+            continue
+        if not r.ok:
+            hint = _STATUS_HINT.get(r.status_code, f"{r.status_code}")
+            return None, f"GET {url} -> {hint} | body: {r.text[:300]}"
+        data = r.json()
+        if data and data.get("data"):
+            return data, None
+        last_body = r.text
+
+    return None, f"GET {url} -> 200 OK tapi field 'data' kosong di semua kombinasi parameter yang dicoba. Body terakhir: {(last_body or '')[:500]}"
 
 
 @st.cache_data(ttl=3600, show_spinner=False)

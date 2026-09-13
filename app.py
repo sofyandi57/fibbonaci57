@@ -528,7 +528,7 @@ def fetch_sector_rotation(days: int = 90):
         return None, f"GET {url} -> {hint} | body: {r.text[:300]}"
     data = r.json()
     if not data or not data.get("data"):
-        return None, None
+        return None, f"GET {url} -> 200 OK tapi field 'data' kosong. Body mentah: {r.text[:500]}"
     return data, None
 
 

@@ -2290,8 +2290,15 @@ def plot_broker_trend_heatmap(net_pivot: pd.DataFrame, top_n: int = 15, category
     if net_pivot.empty:
         return None
     pivot = net_pivot
-    if category and category_filter:
-        keep = [b for b in pivot.index if category.get(str(b), "RETAIL") == category_filter]
+    if category_filter:
+        # BUG FIX: sebelumnya `if category and category_filter` -- kalau
+        # category map kosong ({}), kondisi ini falsy walau filter dipilih,
+        # jadi filter DIAM-DIAM diabaikan dan selalu menampilkan semua
+        # broker. `category or {}` memastikan filter tetap dievaluasi;
+        # broker yang tidak ada di map dianggap RETAIL (fallback default
+        # build_broker_category_map()).
+        cat_map = category or {}
+        keep = [b for b in pivot.index if cat_map.get(str(b), "RETAIL") == category_filter]
         if not keep:
             return None
         pivot = pivot.loc[keep]
@@ -2714,6 +2721,18 @@ if mode == "Analisis Satu Saham":
             price_df, net_pivot = inventory_to_frames(inv_data)
             if not net_pivot.empty:
                 category_map = build_broker_category_map(ticker)
+                if not category_map:
+                    st.warning(
+                        "⚠️ Segmentasi broker (Retail/Big Money/Foreign) gagal diambil "
+                        "untuk ticker ini — endpoint investor=f/d mungkin butuh paket "
+                        "lebih tinggi atau tidak ada data. Filter kategori di bawah "
+                        "tidak akan menampilkan hasil selain 'Semua'."
+                    )
+                else:
+                    n_foreign = sum(1 for v in category_map.values() if v == "FOREIGN")
+                    n_big = sum(1 for v in category_map.values() if v == "BIG MONEY")
+                    n_retail = sum(1 for v in category_map.values() if v == "RETAIL")
+                    st.caption(f"Segmentasi broker terklasifikasi: {n_foreign} Foreign, {n_big} Big Money, {n_retail} Retail.")
 
                 cat_choice = st.radio(
                     "Filter kategori broker", ["Semua", "Retail", "Big Money", "Foreign"],

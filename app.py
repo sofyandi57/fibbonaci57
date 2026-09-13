@@ -1897,13 +1897,21 @@ if mode == "Analisis Satu Saham":
         posts, posts_err = fetch_stock_posts(ticker)
         if posts:
             for p in posts:
-                title = p.get("title") or p.get("content", "")[:80] or "(tanpa judul)"
+                if not isinstance(p, dict):
+                    # Skema respons /posts/space/{code} belum terverifikasi ke
+                    # dokumentasi -- kalau ternyata bukan objek per field
+                    # seperti diasumsikan, tampilkan apa adanya daripada crash.
+                    with st.container(border=True):
+                        st.write(p)
+                    continue
+                title = p.get("title") or str(p.get("content", ""))[:80] or "(tanpa judul)"
                 body = p.get("content") or p.get("body") or ""
                 author = p.get("author", {}).get("name") if isinstance(p.get("author"), dict) else p.get("author")
                 created = p.get("created_at") or p.get("date") or p.get("createdAt")
                 with st.container(border=True):
                     st.markdown(f"**{title}**")
                     if body and body != title:
+                        body = str(body)
                         st.write(body[:400] + ("..." if len(body) > 400 else ""))
                     meta = " · ".join(str(x) for x in [author, created] if x)
                     if meta:

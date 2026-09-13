@@ -951,14 +951,15 @@ def fetch_shareholder_relation(code: str, depth: int = 3, min_percentage: float 
     return data, None
 
 
-def fetch_ng_daily_summary(code: str, day: date):
+def fetch_daily_broker_summary(code: str, day: date, market: str = "RG"):
     """
-    Broker summary pasar NEGOSIASI (NG) untuk SATU hari spesifik -- dipakai
-    untuk merekonsiliasi transaksi insider ke broker pelaksana. Beda dari
-    fetch_broker_summary() yang agregat multi-hari & market RG.
+    Broker summary untuk SATU hari spesifik di market tertentu (RG/NG/TN).
+    Di-cache permanen per (code, day, market) -- data historis harian tidak
+    pernah berubah, jadi TTL tidak relevan (beda dari fetch_broker_summary
+    yang agregat multi-hari & selalu market RG dengan cutoff EOD).
     """
     day_str = day.isoformat()
-    key = f"{code}|ng|{day_str}"
+    key = f"{code}|dailysum|{market}|{day_str}"
     payload, fetched_at = db_get_kv(key)
     if payload and fetched_at:
         return pd.read_json(io.StringIO(payload)) if payload != "[]" else pd.DataFrame()
@@ -967,7 +968,7 @@ def fetch_ng_daily_summary(code: str, day: date):
     try:
         r = requests.get(
             f"{BASE_URL}/analysis/summary/stock/{code}",
-            params={"from": day_str, "to": day_str, "investor": "all", "market": "NG"},
+            params={"from": day_str, "to": day_str, "investor": "all", "market": market},
             headers={"Authorization": f"Bearer {api_key}"}, timeout=30,
         )
     except requests.RequestException:
@@ -983,6 +984,27 @@ def fetch_ng_daily_summary(code: str, day: date):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
     return df
+
+
+def fetch_ng_daily_summary(code: str, day: date):
+    """Alias market NG -- dipakai reconcile_insider_to_broker()."""
+    return fetch_daily_broker_summary(code, day, market="NG")
+
+
+def broker_top3_concentration(summary: pd.DataFrame):
+    """
+    Konsentrasi 3 broker TERBESAR (by buy_volume) sebagai persentase dari
+    total volume beli hari itu -- metrik "Top Broker Concentration %" ala
+    FlowTracker Flow Analyzer. BEDA dari broker_top3_accumulate(): itu
+    filter net beli-jual multi-hari, ini murni pangsa volume SATU hari.
+    """
+    if summary is None or summary.empty or "buy_volume" not in summary.columns:
+        return None
+    total = float(summary["buy_volume"].sum())
+    if total <= 0:
+        return None
+    top3_sum = float(summary.nlargest(3, "buy_volume")["buy_volume"].sum())
+    return top3_sum / total * 100
 
 
 def reconcile_insider_to_broker(code: str, insider_df: pd.DataFrame, tolerance: float = 0.05):
@@ -1800,6 +1822,40 @@ def bandar_analysis(code: str, lookback: int):
 
 
 # --------------------------------------------------------------------------
+# FLOW ANALYZER -- porting tabel utama FlowTracker (lihat anatomi-flowtracker.md):
+# konsentrasi top-3 broker per hari (bukan agregat multi-hari) selama 5 hari
+# bursa terakhir (D-4..D0), diurutkan menurun berdasarkan D0.
+# --------------------------------------------------------------------------
+FLOW_ANALYZER_DAYS = 5
+
+
+def flow_analyzer_row(code: str, lookback: int = 30):
+    """Satu baris Flow Analyzer untuk satu ticker: harga, chg harian, konsentrasi D-4..D0."""
+    df = fetch_daily_chart(code, lookback)
+    if df is None or len(df) < FLOW_ANALYZER_DAYS + 1:
+        return None
+
+    last_n = df.tail(FLOW_ANALYZER_DAYS).reset_index(drop=True)
+    concentrations = []
+    last_val = None
+    for i, row in last_n.iterrows():
+        summary = fetch_daily_broker_summary(code, row["date"], market="RG")
+        concentrations.append(broker_top3_concentration(summary))
+        if i == len(last_n) - 1 and summary is not None and not summary.empty and "buy_value" in summary.columns:
+            last_val = float(pd.to_numeric(summary["buy_value"], errors="coerce").sum())
+
+    price = float(df["close"].iloc[-1])
+    prev_price = float(df["close"].iloc[-2])
+    daily_chg = (price - prev_price) / prev_price * 100 if prev_price else 0.0
+
+    row = {"code": code, "last_val": last_val, "price": price, "daily_chg": daily_chg}
+    labels = [f"d{FLOW_ANALYZER_DAYS - 1 - i}" for i in range(FLOW_ANALYZER_DAYS)]  # d4,d3,d2,d1,d0
+    for label, conc in zip(labels, concentrations):
+        row[label] = conc
+    return row
+
+
+# --------------------------------------------------------------------------
 # CHART
 # --------------------------------------------------------------------------
 def plot_chart(df, retr, low_p, high_p):
@@ -2467,14 +2523,12 @@ elif mode == "Screener Multi-Saham":
 # MODE 3 — SCREENER BANDAR (AKUMULASI / DISTRIBUSI)
 # ==========================================================================
 elif mode == "Screener Bandar":
-    st.subheader("🕵️ Screener Bandarmologi: Akumulasi vs Distribusi")
-    st.markdown(
-        """
-        Mendeteksi saham **sideways yang sudah diakumulasi/distribusi bandar**
-        berdasarkan indikator BDM — **termasuk fase dini sebelum
-        volume breakout**. Konfirmasi volume: volume hari ini > **1.5x**
-        rata-rata 20 hari terakhir.
-        """
+    st.subheader("🕵️ Screener Bandarmologi")
+    st.caption(
+        "Tab **Flow Analyzer** porting langsung dari tabel utama FlowTracker "
+        "(konsentrasi top-3 broker per hari, 5 hari terakhir). Tab **BDM "
+        "Akumulasi/Distribusi** adalah pendekatan lain berbasis indikator BDM "
+        "(fase dini sebelum breakout volume) yang sudah ada sebelumnya."
     )
 
     uni_col, lim_col = st.columns(2)
@@ -2500,123 +2554,189 @@ elif mode == "Screener Bandar":
 
     tickers = tickers[:max_stocks]
 
-    # --- filter kedua: konsentrasi broker ---
-    st.markdown("**Filter kedua (opsional): konsentrasi broker**")
-    use_broker_filter = st.checkbox(
-        "3 broker teratas sedang ngumpulin & broker #1 ≥ 2x broker #2",
-        value=False,
-    )
-    broker_window = st.selectbox("Rentang agregasi broker", [10, 20, 60], index=1)
+    tab_flow, tab_bdm = st.tabs(["📊 Flow Analyzer", "🕵️ BDM Akumulasi/Distribusi"])
 
-    run_col, note_col = st.columns([1, 3])
-    run_scan = run_col.button("▶️ Scan Bandar", type="primary")
-    note_col.caption("Sekali scan — hasil disimpan di session; tombol biru/merah di bawah hanya memfilter (hemat kuota).")
+    # ======================================================================
+    # TAB FLOW ANALYZER — porting FlowTracker: konsentrasi top-3 broker/hari
+    # ======================================================================
+    with tab_flow:
+        st.caption(
+            "**Top Broker Concentration %** = pangsa volume beli 3 broker "
+            "terbesar terhadap total volume beli hari itu, per market RG. "
+            "Kolom D-4..D0 = 5 hari bursa terakhir, diurutkan menurun "
+            "berdasarkan D0 (paling terkonsentrasi hari ini di atas)."
+        )
+        view_limit = st.selectbox("View limit", [10, 50, 100], index=0, key="flow_view_limit")
 
-    if run_scan:
-        rows, errors = [], 0
-        prog = st.progress(0, text="Memulai scan bandar…")
-        for i, code in enumerate(tickers):
-            prog.progress(
-                (i + 1) / len(tickers), text=f"Scan {code} ({i+1}/{len(tickers)})…"
-            )
-            try:
-                row = bandar_analysis(code, lookback)
-                if row:
-                    if use_broker_filter:
-                        binfo = broker_top3_accumulate(
-                            fetch_broker_summary(code, broker_window)
-                        )
-                        row.update(binfo or {})
-                    rows.append(row)
-            except Exception:
-                errors += 1
-            time.sleep(0.05)
-        prog.empty()
-        st.session_state["bandar_rows"] = rows
-        st.session_state["bandar_errors"] = errors
+        if st.button("▶️ Jalankan Flow Analyzer", type="primary"):
+            flow_rows, flow_errors = [], 0
+            prog = st.progress(0, text="Memulai Flow Analyzer…")
+            for i, code in enumerate(tickers):
+                prog.progress((i + 1) / len(tickers), text=f"Scan {code} ({i+1}/{len(tickers)})…")
+                try:
+                    row = flow_analyzer_row(code)
+                    if row:
+                        flow_rows.append(row)
+                except Exception:
+                    flow_errors += 1
+            prog.empty()
+            st.session_state["flow_rows"] = flow_rows
+            st.session_state["flow_errors"] = flow_errors
 
-    if "bandar_rows" not in st.session_state or not st.session_state["bandar_rows"]:
-        if run_scan:
-            st.warning("Tidak ada data bandar yang berhasil diambil (BDM butuh paket tertentu).")
+        if "flow_rows" not in st.session_state or not st.session_state["flow_rows"]:
+            st.info("Klik **▶️ Jalankan Flow Analyzer** untuk memulai.")
         else:
-            st.info("Klik **▶️ Scan Bandar** untuk memulai.")
-        st.stop()
+            flow_rows = st.session_state["flow_rows"]
+            flow_errors = st.session_state.get("flow_errors", 0)
+            flow_res = pd.DataFrame(flow_rows).sort_values("d0", ascending=False, na_position="last")
+            st.success(f"Scan selesai: {len(flow_res)} saham, {flow_errors} gagal.")
 
-    rows = st.session_state["bandar_rows"]
-    errors = st.session_state.get("bandar_errors", 0)
-    res = pd.DataFrame(rows)
+            display_df = flow_res.head(view_limit).copy()
+            for col in ["d4", "d3", "d2", "d1", "d0"]:
+                display_df[col] = display_df[col].apply(lambda v: f"{v:.2f}%" if pd.notna(v) else "-")
+            display_df["daily_chg"] = display_df["daily_chg"].apply(lambda v: f"{v:+.2f}%")
+            display_df["last_val"] = display_df["last_val"].apply(id_number)
+            display_df["price"] = display_df["price"].apply(lambda v: id_number(v))
+            display_df = display_df.rename(columns={
+                "code": "Ticker", "last_val": "Last Val", "d4": "D-4", "d3": "D-3",
+                "d2": "D-2", "d1": "D-1", "d0": "D 0", "daily_chg": "Daily Chg", "price": "Harga",
+            })[["Ticker", "Last Val", "D-4", "D-3", "D-2", "D-1", "D 0", "Daily Chg", "Harga"]]
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-    st.success(f"Scan selesai: {len(res)} saham, {errors} gagal.")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Akumulasi (≥60% BDM+)", int((res["kind"] == "AKUMULASI").sum()))
-    c2.metric("— di antaranya breakout vol", int(((res["kind"] == "AKUMULASI") & res["vol_breakout"]).sum()))
-    c3.metric("Distribusi (≤40% BDM+)", int((res["kind"] == "DISTRIBUSI").sum()))
-    c4.metric("Sideways sempit", int(res["sideways"].sum()))
+            st.download_button(
+                "⬇️ Download hasil (CSV)",
+                data=flow_res.to_csv(index=False).encode("utf-8"),
+                file_name=f"flow_analyzer_{date.today().isoformat()}.csv",
+                mime="text/csv",
+            )
 
-    only_side = st.checkbox("Hanya tampilkan yang sideways (range ≤15%)", value=True)
-
-    f1, f2, f3 = st.columns(3)
-    show_acc = f1.button("🔵 Tampilkan Akumulasi", use_container_width=True)
-    show_dist = f2.button("🔴 Tampilkan Distribusi", use_container_width=True)
-    show_all = f3.button("⚪ Tampilkan Semua", use_container_width=True)
-
-    if "bandar_filter" not in st.session_state:
-        st.session_state["bandar_filter"] = "AKUMULASI"
-    if show_acc:
-        st.session_state["bandar_filter"] = "AKUMULASI"
-    if show_dist:
-        st.session_state["bandar_filter"] = "DISTRIBUSI"
-    if show_all:
-        st.session_state["bandar_filter"] = "ALL"
-
-    active = st.session_state["bandar_filter"]
-    view = res.copy()
-    if active != "ALL":
-        view = view[view["kind"] == active]
-    if only_side:
-        view = view[view["sideways"]]
-    if use_broker_filter and "broker_filter_pass" in view.columns:
-        view = view[view["broker_filter_pass"] == True]  # noqa: E712
-
-    cols = ["code", "price", "stage", "range_pct", "acc_pct", "net_bdm",
-            "vol_ratio", "sideways"]
-    if use_broker_filter and "b1" in view.columns:
-        cols += ["b1", "b2", "b3", "ratio_1v2"]
-    view = view.sort_values(
-        ["vol_breakout", "acc_pct" if active == "DISTRIBUSI" else "acc_pct"],
-        ascending=[False, active == "DISTRIBUSI"],
-    )
-    st.dataframe(view[cols], use_container_width=True, hide_index=True)
-    if use_broker_filter and view.empty:
-        st.warning(
-            "Tidak ada yang lolos kombinasi filter — coba longgarkan "
-            "(matikan 'hanya sideways' atau perpendek rentang broker)."
+    # ======================================================================
+    # TAB BDM AKUMULASI/DISTRIBUSI — logika lama, tidak berubah
+    # ======================================================================
+    with tab_bdm:
+        st.markdown(
+            """
+            Mendeteksi saham **sideways yang sudah diakumulasi/distribusi bandar**
+            berdasarkan indikator BDM — **termasuk fase dini sebelum
+            volume breakout**. Konfirmasi volume: volume hari ini > **1.5x**
+            rata-rata 20 hari terakhir.
+            """
         )
 
-    st.download_button(
-        "⬇️ Download hasil (CSV)",
-        data=res.to_csv(index=False).encode("utf-8"),
-        file_name=f"bandar_screener_{date.today().isoformat()}.csv",
-        mime="text/csv",
-    )
+        use_broker_filter = st.checkbox(
+            "Filter kedua: 3 broker teratas sedang ngumpulin & broker #1 ≥ 2x broker #2",
+            value=False,
+        )
+        broker_window = st.selectbox("Rentang agregasi broker", [10, 20, 60], index=1)
 
-    if st.button("✨ Ringkasan AI hasil tersaring", use_container_width=True):
-        if view.empty:
-            st.warning("Hasil tersaring kosong — longgarkan filter.")
+        run_col, note_col = st.columns([1, 3])
+        run_scan = run_col.button("▶️ Scan Bandar", type="primary")
+        note_col.caption("Sekali scan — hasil disimpan di session; tombol biru/merah di bawah hanya memfilter (hemat kuota).")
+
+        if run_scan:
+            rows, errors = [], 0
+            prog = st.progress(0, text="Memulai scan bandar…")
+            for i, code in enumerate(tickers):
+                prog.progress(
+                    (i + 1) / len(tickers), text=f"Scan {code} ({i+1}/{len(tickers)})…"
+                )
+                try:
+                    row = bandar_analysis(code, lookback)
+                    if row:
+                        if use_broker_filter:
+                            binfo = broker_top3_accumulate(
+                                fetch_broker_summary(code, broker_window)
+                            )
+                            row.update(binfo or {})
+                        rows.append(row)
+                except Exception:
+                    errors += 1
+                time.sleep(0.05)
+            prog.empty()
+            st.session_state["bandar_rows"] = rows
+            st.session_state["bandar_errors"] = errors
+
+        if "bandar_rows" not in st.session_state or not st.session_state["bandar_rows"]:
+            if run_scan:
+                st.warning("Tidak ada data bandar yang berhasil diambil (BDM butuh paket tertentu).")
+            else:
+                st.info("Klik **▶️ Scan Bandar** untuk memulai.")
         else:
-            summary = view[cols].to_string(index=False)
-            prompt = (
-                "Berikut hasil screener bandarmologi (BDM) untuk saham IDX:\n\n"
-                f"{summary}\n\n"
-                "Buat ringkasan Bahasa Indonesia: mana yang akumulasi paling "
-                "kuat, mana yang waspada distribusi, arti fase 'DINI' vs "
-                "'BREAKOUT VOLUME', dan hal yang perlu dikonfirmasi sebelum "
-                "entry. Ingatkan bahwa ini bukan rekomendasi beli/jual."
+            rows = st.session_state["bandar_rows"]
+            errors = st.session_state.get("bandar_errors", 0)
+            res = pd.DataFrame(rows)
+
+            st.success(f"Scan selesai: {len(res)} saham, {errors} gagal.")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Akumulasi (≥60% BDM+)", int((res["kind"] == "AKUMULASI").sum()))
+            c2.metric("— di antaranya breakout vol", int(((res["kind"] == "AKUMULASI") & res["vol_breakout"]).sum()))
+            c3.metric("Distribusi (≤40% BDM+)", int((res["kind"] == "DISTRIBUSI").sum()))
+            c4.metric("Sideways sempit", int(res["sideways"].sum()))
+
+            only_side = st.checkbox("Hanya tampilkan yang sideways (range ≤15%)", value=True)
+
+            f1, f2, f3 = st.columns(3)
+            show_acc = f1.button("🔵 Tampilkan Akumulasi", use_container_width=True)
+            show_dist = f2.button("🔴 Tampilkan Distribusi", use_container_width=True)
+            show_all = f3.button("⚪ Tampilkan Semua", use_container_width=True)
+
+            if "bandar_filter" not in st.session_state:
+                st.session_state["bandar_filter"] = "AKUMULASI"
+            if show_acc:
+                st.session_state["bandar_filter"] = "AKUMULASI"
+            if show_dist:
+                st.session_state["bandar_filter"] = "DISTRIBUSI"
+            if show_all:
+                st.session_state["bandar_filter"] = "ALL"
+
+            active = st.session_state["bandar_filter"]
+            view = res.copy()
+            if active != "ALL":
+                view = view[view["kind"] == active]
+            if only_side:
+                view = view[view["sideways"]]
+            if use_broker_filter and "broker_filter_pass" in view.columns:
+                view = view[view["broker_filter_pass"] == True]  # noqa: E712
+
+            cols = ["code", "price", "stage", "range_pct", "acc_pct", "net_bdm",
+                    "vol_ratio", "sideways"]
+            if use_broker_filter and "b1" in view.columns:
+                cols += ["b1", "b2", "b3", "ratio_1v2"]
+            view = view.sort_values(
+                ["vol_breakout", "acc_pct" if active == "DISTRIBUSI" else "acc_pct"],
+                ascending=[False, active == "DISTRIBUSI"],
             )
-            try:
-                st.markdown(groq_chat(prompt))
-            except Exception as e:
-                st.error(f"Groq error: {e}")
+            st.dataframe(view[cols], use_container_width=True, hide_index=True)
+            if use_broker_filter and view.empty:
+                st.warning(
+                    "Tidak ada yang lolos kombinasi filter — coba longgarkan "
+                    "(matikan 'hanya sideways' atau perpendek rentang broker)."
+                )
+
+            st.download_button(
+                "⬇️ Download hasil (CSV)",
+                data=res.to_csv(index=False).encode("utf-8"),
+                file_name=f"bandar_screener_{date.today().isoformat()}.csv",
+                mime="text/csv",
+            )
+
+            if st.button("✨ Ringkasan AI hasil tersaring", use_container_width=True):
+                if view.empty:
+                    st.warning("Hasil tersaring kosong — longgarkan filter.")
+                else:
+                    summary = view[cols].to_string(index=False)
+                    prompt = (
+                        "Berikut hasil screener bandarmologi (BDM) untuk saham IDX:\n\n"
+                        f"{summary}\n\n"
+                        "Buat ringkasan Bahasa Indonesia: mana yang akumulasi paling "
+                        "kuat, mana yang waspada distribusi, arti fase 'DINI' vs "
+                        "'BREAKOUT VOLUME', dan hal yang perlu dikonfirmasi sebelum "
+                        "entry. Ingatkan bahwa ini bukan rekomendasi beli/jual."
+                    )
+                    try:
+                        st.markdown(groq_chat(prompt))
+                    except Exception as e:
+                        st.error(f"Groq error: {e}")
 
 # ==========================================================================
 # MODE 4 — OUTLOOK PASAR (IHSG, rotasi sektor, notasi khusus market-wide)

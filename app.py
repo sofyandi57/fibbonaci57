@@ -2703,18 +2703,24 @@ with st.sidebar:
     lookback = st.slider("Lookback (hari)", 60, 365, 200)
     max_risk = st.slider("Batas risiko maksimum (%)", 3, 15, 8)
     st.divider()
-    st.caption("Filter universe (berlaku di semua mode screener)")
-    use_value_filter = st.checkbox("Filter nilai transaksi harian", value=True)
+    st.caption("Filter universe (opsional, berlaku di semua mode screener)")
+    use_value_filter = st.checkbox(
+        "Filter nilai transaksi harian (mati default)", value=False,
+        help="Nyalakan kalau mau screening khusus saham bervolume kecil "
+             "('gorengan'). Saham populer (BUMI, BRMS, dll) biasanya nilai "
+             "transaksinya jauh di atas Rp10M/hari dan akan ke-skip semua "
+             "kalau filter ini aktif.",
+    )
     value_filter_miliar = st.number_input(
-        "Maks. nilai transaksi harian (Rp Miliar)", min_value=1, max_value=1000, value=10, step=1,
+        "Maks. nilai transaksi harian (Rp Miliar)", min_value=1, max_value=100_000, value=10, step=1,
         disabled=not use_value_filter,
     )
     max_daily_value = (value_filter_miliar * 1_000_000_000) if use_value_filter else None
-    st.caption(
-        "Ticker dengan nilai transaksi harian (close × volume) di atas ambang "
-        "ini di-skip SEBELUM panggilan broker/BDM tambahan — dicek dari data "
-        "harga yang sudah diambil, tidak menambah kuota API."
-    )
+    if use_value_filter:
+        st.caption(
+            "Ticker dengan nilai transaksi harian (close × volume) di atas ambang "
+            "ini di-skip SEBELUM panggilan broker/BDM tambahan."
+        )
     st.divider()
     st.caption("API key diambil dari Streamlit Secrets.")
 

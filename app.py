@@ -67,7 +67,7 @@ BDM_DIST_THRESHOLD = 0.4  # <=40% hari BDM positif = distribusi
 VOL_BREAKOUT_MULT = 1.5  # volume harian > 1.5x rata-rata 20 hari
 
 st.set_page_config(
-    page_title="InvezGo Fib Pullback",
+    page_title="Yandi Screener",
     page_icon="📈",
     layout="wide",
 )
@@ -501,7 +501,7 @@ INSIDER_LOOKBACK_MONTHS = 18
 _STATUS_HINT = {
     401: "401 Unauthorized — API key tidak valid.",
     402: "402 Payment Required — endpoint ini butuh paket/langganan lebih tinggi dari yang kamu punya.",
-    404: "404 Not Found — path endpoint kemungkinan salah/berbeda dari dokumentasi InvezGo.",
+    404: "404 Not Found — path endpoint kemungkinan salah/berbeda dari dokumentasi API.",
     429: "429 Rate limited — coba lagi beberapa saat.",
 }
 
@@ -1640,7 +1640,7 @@ def plot_shareholder_relation(relation_data: dict, root_code: str):
 # --------------------------------------------------------------------------
 # UI
 # --------------------------------------------------------------------------
-st.title("📈 InvezGo — Fib Pullback + Bandar Screener (IDX)")
+st.title("📈 Yandi Screener")
 st.caption(
     "Edukasi teknikal: strategi Weak/Strong Pullback Fibonacci + screener "
     "bandarmologi. Data di-cache di SQLite (hemat kuota API). "
@@ -1938,8 +1938,8 @@ if mode == "Analisis Satu Saham":
 
         st.subheader("📰 Berita & Diskusi Terkini")
         st.caption(
-            "InvezGo tidak menyediakan endpoint berita/wire resmi — ini postingan "
-            "komunitas dari platform InvezGo terkait saham ini. Perlakukan sebagai "
+            "Tidak ada endpoint berita/wire resmi — ini postingan "
+            "komunitas dari platform data terkait saham ini. Perlakukan sebagai "
             "sentimen komunitas, BUKAN berita tervalidasi dari media."
         )
         posts, posts_err = fetch_stock_posts(ticker)
@@ -2037,7 +2037,7 @@ if mode == "Analisis Satu Saham":
 
         st.subheader("📈 Key Statistics / Rasio Valuasi")
         st.caption(
-            "⚠️ Menurut dokumentasi resmi InvezGo, endpoint ini masih dalam proses "
+            "⚠️ Menurut dokumentasi resmi penyedia data, endpoint ini masih dalam proses "
             "aktualisasi/kalibrasi — angka bisa kurang akurat, verifikasi silang sebelum dipakai."
         )
         keystat_data, keystat_err = fetch_keystat(ticker, period_code)
@@ -2187,7 +2187,7 @@ else:
     st.markdown(
         """
         Mendeteksi saham **sideways yang sudah diakumulasi/distribusi bandar**
-        berdasarkan indikator BDM invEZGo — **termasuk fase dini sebelum
+        berdasarkan indikator BDM — **termasuk fase dini sebelum
         volume breakout**. Konfirmasi volume: volume hari ini > **1.5x**
         rata-rata 20 hari terakhir.
         """
@@ -2341,7 +2341,7 @@ with st.expander("ℹ️ Cara membaca"):
         - **Cache database** — data OHLCV & BDM tersimpan di **Supabase**
           (persisten, shared antar instance) atau fallback SQLite lokal
           (`fib_cache.db`); app hanya menarik data yang belum ada di cache →
-          kuota invEZGo hemat.
+          kuota API hemat.
         - **Swing high/low** hanya valid jika candle berikutnya *menutupi body*
           candle sebelum titik tersebut (aturan konfirmasi).
         - **Weak pullback** → harga rebound setelah turun satu level fib:

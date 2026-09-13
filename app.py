@@ -829,6 +829,87 @@ def reconcile_insider_to_broker(code: str, insider_df: pd.DataFrame, tolerance: 
     return pd.DataFrame(results)
 
 
+# --------------------------------------------------------------------------
+# PROFIL PERUSAHAAN & POST KOMUNITAS ("BERITA")
+# --------------------------------------------------------------------------
+COMPANY_INFO_CACHE_TTL_HOURS = 24 * 7  # profil perusahaan jarang berubah
+
+
+def fetch_company_info(code: str):
+    """
+    Profil perusahaan: nama, sektor/subsektor, industri, alamat, website,
+    tanggal listing, direksi/komisaris, notasi khusus (kalau ada).
+    Endpoint: GET /analysis/information/{code} -- verified api-1.json.
+    """
+    key = f"{code}|information"
+    payload, fetched_at = db_get_kv(key)
+    if payload and fetched_at:
+        try:
+            age_hours = (_wib_now() - _dt.fromisoformat(fetched_at)).total_seconds() / 3600
+            if age_hours < COMPANY_INFO_CACHE_TTL_HOURS:
+                return json.loads(payload), None
+        except (ValueError, TypeError, json.JSONDecodeError):
+            pass
+
+    api_key = get_secret("INVEZGO_API_KEY")
+    url = f"{BASE_URL}/analysis/information/{code}"
+    try:
+        r = requests.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=30)
+    except requests.RequestException as e:
+        cached = json.loads(payload) if payload else None
+        return cached, f"Request error: {e}"
+    if not r.ok:
+        cached = json.loads(payload) if payload else None
+        hint = _STATUS_HINT.get(r.status_code, f"{r.status_code}")
+        return cached, f"GET {url} -> {hint} | body: {r.text[:300]}"
+    data = r.json()
+    if not data:
+        return None, None
+    db_set_kv(key, json.dumps(data), _wib_now().isoformat())
+    return data, None
+
+
+def fetch_stock_posts(code: str, limit: int = 10):
+    """
+    Postingan komunitas InvezGo terkait saham ini ("space" per-stock) --
+    CATATAN: ini bukan berita dari media/wire resmi (InvezGo tidak
+    menyediakan endpoint news murni), melainkan diskusi/postingan user di
+    platform InvezGo. Perlakukan sebagai sentimen komunitas, bukan berita
+    tervalidasi.
+    Endpoint: GET /posts/space/{code}.
+    """
+    key = f"{code}|posts|{limit}"
+    payload, fetched_at = db_get_kv(key)
+    if payload and fetched_at:
+        try:
+            age_hours = (_wib_now() - _dt.fromisoformat(fetched_at)).total_seconds() / 3600
+            if age_hours < 1:  # postingan bisa sering berubah, cache pendek
+                return json.loads(payload), None
+        except (ValueError, TypeError, json.JSONDecodeError):
+            pass
+
+    api_key = get_secret("INVEZGO_API_KEY")
+    url = f"{BASE_URL}/posts/space/{code}"
+    try:
+        r = requests.get(
+            url, params={"page": 1, "limit": limit},
+            headers={"Authorization": f"Bearer {api_key}"}, timeout=30,
+        )
+    except requests.RequestException as e:
+        cached = json.loads(payload) if payload else None
+        return cached, f"Request error: {e}"
+    if not r.ok:
+        cached = json.loads(payload) if payload else None
+        hint = _STATUS_HINT.get(r.status_code, f"{r.status_code}")
+        return cached, f"GET {url} -> {hint} | body: {r.text[:300]}"
+    data = r.json()
+    items = data.get("data", data) if isinstance(data, dict) else data
+    if not items:
+        return None, None
+    db_set_kv(key, json.dumps(data), _wib_now().isoformat())
+    return items, None
+
+
 def broker_top3_accumulate(summary: pd.DataFrame):
     """
     Filter '3 broker teratas ngumpulin, broker #1 >= 2x broker #2'.
@@ -1396,6 +1477,38 @@ if mode == "Analisis Satu Saham":
 
     ticker = st.session_state["single_ticker"]
 
+    # --- Profil perusahaan ---
+    info, info_err = fetch_company_info(ticker)
+    if info:
+        i1, i2 = st.columns([1, 4])
+        with i1:
+            if info.get("logo"):
+                st.image(info["logo"], width=80)
+        with i2:
+            st.markdown(f"### {info.get('name', ticker)} ({ticker})")
+            st.caption(
+                f"{info.get('sector', '-')} · {info.get('subsector', '-')} · "
+                f"{info.get('industry', '-')} — {info.get('activity', '-')}"
+            )
+        notations = info.get("notation") or []
+        if notations:
+            for n in notations:
+                st.warning(f"⚠️ Notasi khusus **{n.get('notation')}**: {n.get('description')}")
+        with st.expander("ℹ️ Detail Perusahaan"):
+            d1, d2 = st.columns(2)
+            d1.write(f"**Alamat:** {info.get('address', '-')}")
+            d1.write(f"**Website:** {info.get('website', '-')}")
+            d1.write(f"**Tanggal Listing:** {info.get('listing_date', '-')}")
+            d1.write(f"**Papan:** {info.get('board', '-')}")
+            if info.get("category"):
+                d2.write(f"**Kategori:** {', '.join(info['category'])}")
+            if info.get("director"):
+                d2.write("**Direksi:** " + ", ".join(p["name"] for p in info["director"]))
+            if info.get("commissioner"):
+                d2.write("**Komisaris:** " + ", ".join(p["name"] for p in info["commissioner"]))
+    elif info_err:
+        st.error(f"❌ Profil perusahaan gagal diambil: {info_err}")
+
     df = fetch_daily_chart(ticker, lookback)
     if df is None or len(df) < 30:
         st.warning(f"Data {ticker} tidak tersedia (saham baru IPO/suspend/delisting).")
@@ -1620,6 +1733,32 @@ if mode == "Analisis Satu Saham":
             st.dataframe(timeline, use_container_width=True, hide_index=True, height=300)
         else:
             st.caption("Tidak ada peristiwa kepemilikan (Lapis A/B) untuk dirangkai jadi timeline.")
+
+    # --- Berita / postingan komunitas ---
+    st.subheader("📰 Berita & Diskusi Terkini")
+    st.caption(
+        "InvezGo tidak menyediakan endpoint berita/wire resmi — ini postingan "
+        "komunitas dari platform InvezGo terkait saham ini. Perlakukan sebagai "
+        "sentimen komunitas, BUKAN berita tervalidasi dari media."
+    )
+    posts, posts_err = fetch_stock_posts(ticker)
+    if posts:
+        for p in posts:
+            title = p.get("title") or p.get("content", "")[:80] or "(tanpa judul)"
+            body = p.get("content") or p.get("body") or ""
+            author = p.get("author", {}).get("name") if isinstance(p.get("author"), dict) else p.get("author")
+            created = p.get("created_at") or p.get("date") or p.get("createdAt")
+            with st.container(border=True):
+                st.markdown(f"**{title}**")
+                if body and body != title:
+                    st.write(body[:400] + ("..." if len(body) > 400 else ""))
+                meta = " · ".join(str(x) for x in [author, created] if x)
+                if meta:
+                    st.caption(meta)
+    elif posts_err:
+        st.error(f"❌ Postingan gagal diambil: {posts_err}")
+    else:
+        st.caption("Tidak ada postingan komunitas untuk saham ini.")
 
     # --- Analisis AI (Groq) ---
     st.subheader("🤖 Analisis AI (Groq)")

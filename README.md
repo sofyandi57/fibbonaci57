@@ -189,17 +189,13 @@ invezgo-fib-app/
 | `GET /analysis/chart/multi-time/{code}` | (opsional) timeframe 1 jam untuk konfirmasi pendek |
 | `GET /analysis/chart/stock/bdm/{code}` | Indikator bandarmologi (BDM) harian |
 | `GET /analysis/summary/stock/{code}` | Agregat buy/sell per broker (konsentrasi broker, akumulator) |
-| `GET /analysis/shareholder/stock/{code}` | Komposisi pemegang saham >1% ⚠️ *path belum diverifikasi ke dokumentasi resmi InvezGo* |
-| `GET /analysis/insider/stock/{code}` | Riwayat transaksi insider ⚠️ *path belum diverifikasi ke dokumentasi resmi InvezGo* |
+| `GET /analysis/shareholder/{code}` | Komposisi pemegang saham >1% (snapshot terbaru) |
+| `GET /analysis/shareholder-insider` | Riwayat transaksi insider (query: `code`, `from`, `to`, `page`, `limit`) |
 
 Autentikasi: header `Authorization: Bearer <API_KEY>`.
 
-> ⚠️ Dua endpoint kepemilikan (shareholder & insider) ditulis mengikuti pola
-> penamaan endpoint lain di atas, TAPI path persisnya belum dicek langsung ke
-> dokumentasi API InvezGo. Kalau panel "🏛️ Kepemilikan" di app menampilkan
-> "data tidak tersedia" terus-menerus, cek path yang benar di dashboard/dokumentasi
-> InvezGo-mu dan sesuaikan `fetch_shareholders()` / `fetch_insider_transactions()`
-> di `app.py`.
+Path dua endpoint kepemilikan di atas sudah diverifikasi langsung ke OpenAPI
+spec resmi InvezGo (`api-1.json`).
 
 ## 📝 Lisensi & Atribusi
 

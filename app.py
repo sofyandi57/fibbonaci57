@@ -506,8 +506,10 @@ _STATUS_HINT = {
 
 def fetch_shareholders(code: str):
     """
-    Komposisi pemegang saham >1% saat ini.
-    Endpoint: GET /analysis/shareholder/stock/{code}.
+    Komposisi pemegang saham >1% saat ini (snapshot terbaru).
+    Endpoint resmi: GET /analysis/shareholder/{code} -- verified via
+    api-1.json (OpenAPI spec InvezGo). Response: list of
+    {name, percentage, badge} langsung (bukan dibungkus objek).
     Cache 24 jam di kv_cache -- data ini terbit bulanan, bukan harian.
     Return (df_or_None, error_message_or_None) -- error selalu diteruskan
     ke UI, tidak ditelan diam-diam, supaya 402/404/401 bisa dibedakan.
@@ -523,7 +525,7 @@ def fetch_shareholders(code: str):
             pass
 
     api_key = get_secret("INVEZGO_API_KEY")
-    url = f"{BASE_URL}/analysis/shareholder/stock/{code}"
+    url = f"{BASE_URL}/analysis/shareholder/{code}"
     try:
         r = requests.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=30)
     except requests.RequestException as e:
@@ -535,19 +537,27 @@ def fetch_shareholders(code: str):
         return cached, f"GET {url} -> {hint} | body: {r.text[:300]}"
     data = r.json()
     if not data:
-        return None, f"GET {url} -> 200 OK tapi respons kosong."
+        return None, None  # 204/[] -- data belum tersedia (baru IPO/suspend), bukan error
     df = pd.DataFrame(data)
     if "percentage" in df.columns:
         df["percentage"] = pd.to_numeric(df["percentage"], errors="coerce")
         df = df.sort_values("percentage", ascending=False).reset_index(drop=True)
+    if "badge" in df.columns:
+        df["badge"] = df["badge"].astype(str).str.strip("{}")
     db_set_kv(key, df.to_json(), _wib_now().isoformat())
     return df, None
 
 
 def fetch_insider_transactions(code: str, months: int = INSIDER_LOOKBACK_MONTHS):
     """
-    Riwayat transaksi insider (wajib lapor >5% / direksi / komisaris).
-    Endpoint: GET /analysis/insider/stock/{code}.
+    Riwayat transaksi insider (direksi/komisaris/pemegang mayoritas wajib
+    lapor). Endpoint resmi: GET /analysis/shareholder-insider -- verified
+    via api-1.json. Query params (BUKAN path param): code, from, to, page,
+    limit. Response: {totalPage, page, nextPage, data: [...]}, setiap
+    elemen data punya info kepemilikan sebelum/sesudah PLUS `subrow`: daftar
+    transaksi aktual di pasar {date, price, status: "Buy"/"Sell", value}.
+    Kita flatten subrow jadi satu baris per transaksi supaya konsisten
+    dengan tabel/verdict di UI.
     Return (df_or_None, error_message_or_None).
     """
     frm = (date.today() - timedelta(days=months * 30)).isoformat()
@@ -564,10 +574,11 @@ def fetch_insider_transactions(code: str, months: int = INSIDER_LOOKBACK_MONTHS)
             pass
 
     api_key = get_secret("INVEZGO_API_KEY")
-    url = f"{BASE_URL}/analysis/insider/stock/{code}"
+    url = f"{BASE_URL}/analysis/shareholder-insider"
     try:
         r = requests.get(
-            url, params={"from": frm, "to": to},
+            url,
+            params={"code": code, "from": frm, "to": to, "page": 1, "limit": 100},
             headers={"Authorization": f"Bearer {api_key}"}, timeout=30,
         )
     except requests.RequestException as e:
@@ -577,23 +588,36 @@ def fetch_insider_transactions(code: str, months: int = INSIDER_LOOKBACK_MONTHS)
         cached = pd.read_json(io.StringIO(payload)) if payload else None
         hint = _STATUS_HINT.get(r.status_code, f"{r.status_code}")
         return cached, f"GET {url} -> {hint} | body: {r.text[:300]}"
-    data = r.json()
-    if not data:
-        return None, None  # 200 OK, memang tidak ada laporan insider -- bukan error
-    df = pd.DataFrame(data)
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"]).dt.date
-        df = df.sort_values("date", ascending=False).reset_index(drop=True)
+    body = r.json()
+    records = body.get("data", []) if isinstance(body, dict) else (body or [])
+    if not records:
+        return None, None  # tidak ada laporan insider di periode ini -- bukan error
+
+    rows = []
+    for rec in records:
+        name = rec.get("name")
+        badge = str(rec.get("badge", "")).strip("{}")
+        for tx in (rec.get("subrow") or []):
+            rows.append({
+                "date": tx.get("date"),
+                "name": name,
+                "badge": badge,
+                "action": tx.get("status"),  # "Buy" / "Sell"
+                "volume": tx.get("value"),
+                "price": tx.get("price"),
+            })
+    if not rows:
+        return None, None
+
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    df = df.sort_values("date", ascending=False).reset_index(drop=True)
     db_set_kv(key, df.to_json(), _wib_now().isoformat())
     return df, None
 
 
 def insider_verdict(insider_df: pd.DataFrame, days: int = 90):
-    """
-    Ringkasan sederhana: dalam `days` hari terakhir, insider net beli atau
-    net jual? Kolom yang dipakai fleksibel karena skema tiap API insider
-    beda-beda -- coba beberapa nama kolom umum.
-    """
+    """Ringkasan: dalam `days` hari terakhir, insider net beli atau net jual?"""
     if insider_df is None or insider_df.empty or "date" not in insider_df.columns:
         return None
     cutoff = date.today() - timedelta(days=days)
@@ -601,14 +625,9 @@ def insider_verdict(insider_df: pd.DataFrame, days: int = 90):
     if recent.empty:
         return {"net_transactions": 0, "verdict": "TIDAK ADA TRANSAKSI", "count": 0}
 
-    vol_col = next((c for c in ["volume", "shares", "amount", "value"] if c in recent.columns), None)
-    action_col = next((c for c in ["action", "type", "transaction_type"] if c in recent.columns), None)
-    if vol_col is None or action_col is None:
-        return {"net_transactions": None, "verdict": "-", "count": len(recent)}
-
-    recent[vol_col] = pd.to_numeric(recent[vol_col], errors="coerce").fillna(0)
-    is_buy = recent[action_col].astype(str).str.lower().str.contains("buy|beli")
-    net = float(recent.loc[is_buy, vol_col].sum() - recent.loc[~is_buy, vol_col].sum())
+    recent["volume"] = pd.to_numeric(recent["volume"], errors="coerce").fillna(0)
+    is_buy = recent["action"].astype(str).str.lower().str.contains("buy|beli")
+    net = float(recent.loc[is_buy, "volume"].sum() - recent.loc[~is_buy, "volume"].sum())
     verdict = "NET BELI (akumulasi insider)" if net > 0 else (
         "NET JUAL (distribusi insider)" if net < 0 else "SEIMBANG"
     )
@@ -1293,7 +1312,7 @@ if mode == "Analisis Satu Saham":
         st.markdown("**Komposisi Pemegang Saham (>1%)**")
         shareholders, sh_err = fetch_shareholders(ticker)
         if shareholders is not None and not shareholders.empty:
-            show_cols = [c for c in ["name", "percentage", "shares", "type"] if c in shareholders.columns]
+            show_cols = [c for c in ["name", "percentage", "badge"] if c in shareholders.columns]
             st.dataframe(
                 shareholders[show_cols] if show_cols else shareholders,
                 use_container_width=True, hide_index=True, height=280,
@@ -1313,7 +1332,7 @@ if mode == "Analisis Satu Saham":
                     "Verdict 90 hari terakhir", verdict["verdict"],
                     delta=f"{verdict['count']} transaksi",
                 )
-            show_cols = [c for c in ["date", "name", "action", "volume", "price"] if c in insider_df.columns]
+            show_cols = [c for c in ["date", "name", "badge", "action", "volume", "price"] if c in insider_df.columns]
             st.dataframe(
                 insider_df[show_cols] if show_cols else insider_df,
                 use_container_width=True, hide_index=True, height=230,

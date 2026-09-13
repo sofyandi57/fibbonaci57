@@ -619,15 +619,17 @@ def _eod_fresh(fetched_at: str) -> bool:
     return ts >= cutoff
 
 
-def fetch_broker_summary(code: str, window: int):
+def fetch_broker_summary(code: str, window: int, investor: str = "all"):
     """
     Agregat buy/sell per broker untuk rentang [today-window, today].
     Endpoint: GET /analysis/summary/stock/{code} (EOD 18:00 WIB).
     Di-cache di kv_cache — scan ulang tidak memakai kuota API.
+    investor: "all" | "f" (asing) | "d" (domestik) -- dipakai untuk
+    memetakan broker asing vs domestik (lihat build_broker_category_map()).
     """
     frm = (date.today() - timedelta(days=window)).isoformat()
     to = date.today().isoformat()
-    key = f"{code}|brokersum|{window}|{frm}"
+    key = f"{code}|brokersum|{investor}|{window}|{frm}"
 
     payload, fetched_at = db_get_kv(key)
     if payload and fetched_at and _eod_fresh(fetched_at):
@@ -637,7 +639,7 @@ def fetch_broker_summary(code: str, window: int):
     try:
         r = requests.get(
             f"{BASE_URL}/analysis/summary/stock/{code}",
-            params={"from": frm, "to": to, "investor": "all", "market": "RG"},
+            params={"from": frm, "to": to, "investor": investor, "market": "RG"},
             headers={"Authorization": f"Bearer {api_key}"},
             timeout=60,
         )
@@ -654,6 +656,49 @@ def fetch_broker_summary(code: str, window: int):
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
     db_set_kv(key, df.to_json(), _wib_now().isoformat())
     return df
+
+
+# --------------------------------------------------------------------------
+# SEGMENTASI RETAIL / BIG MONEY / FOREIGN -- InvezGo TIDAK punya field
+# retail/big-money native (hanya investor=all/f/d, f=asing, d=domestik).
+# "Big Money" vs "Retail" di sini adalah PROXY berbasis rata-rata tiket
+# transaksi (value/freq) per broker -- teknik yang sama disebut di skill
+# naya-analisa-transaksi ("Tiket pasar = value intraday / freq, indikator
+# ritel vs besar"). Threshold bisa salah klasifikasi untuk broker
+# campuran (institusi yang juga layani ritel) -- SELALU ditandai sebagai
+# estimasi di UI, bukan kategori resmi bursa.
+# --------------------------------------------------------------------------
+BIG_MONEY_TICKET_THRESHOLD = 50_000_000  # rata-rata nilai per transaksi (Rp) di atas ini dianggap "Big Money"
+
+
+def build_broker_category_map(code: str, window: int = 60):
+    """
+    Petakan tiap kode broker yang aktif di saham ini -> 'FOREIGN' / 'BIG MONEY'
+    / 'RETAIL', dari agregat window (2 panggilan API: investor=f & investor=d),
+    bukan per-hari -- klasifikasi dianggap stabil dalam window ini.
+    """
+    foreign_df = fetch_broker_summary(code, window, investor="f")
+    domestic_df = fetch_broker_summary(code, window, investor="d")
+
+    category = {}
+    if foreign_df is not None and not foreign_df.empty and "code" in foreign_df.columns:
+        for c in foreign_df["code"]:
+            category[str(c)] = "FOREIGN"
+
+    if domestic_df is not None and not domestic_df.empty and "code" in domestic_df.columns:
+        df = domestic_df.copy()
+        buy_freq = pd.to_numeric(df.get("buy_freq", 0), errors="coerce").fillna(0)
+        sell_freq = pd.to_numeric(df.get("sell_freq", 0), errors="coerce").fillna(0)
+        buy_val = pd.to_numeric(df.get("buy_value", 0), errors="coerce").fillna(0)
+        sell_val = pd.to_numeric(df.get("sell_value", 0), errors="coerce").fillna(0)
+        total_freq = (buy_freq + sell_freq).replace(0, pd.NA)
+        avg_ticket = (buy_val + sell_val) / total_freq
+        for c, ticket in zip(df["code"], avg_ticket):
+            if str(c) in category:
+                continue  # sudah masuk FOREIGN, jangan ditimpa
+            category[str(c)] = "BIG MONEY" if pd.notna(ticket) and ticket >= BIG_MONEY_TICKET_THRESHOLD else "RETAIL"
+
+    return category
 
 
 # --------------------------------------------------------------------------
@@ -951,15 +996,16 @@ def fetch_shareholder_relation(code: str, depth: int = 3, min_percentage: float 
     return data, None
 
 
-def fetch_daily_broker_summary(code: str, day: date, market: str = "RG"):
+def fetch_daily_broker_summary(code: str, day: date, market: str = "RG", investor: str = "all"):
     """
-    Broker summary untuk SATU hari spesifik di market tertentu (RG/NG/TN).
-    Di-cache permanen per (code, day, market) -- data historis harian tidak
-    pernah berubah, jadi TTL tidak relevan (beda dari fetch_broker_summary
-    yang agregat multi-hari & selalu market RG dengan cutoff EOD).
+    Broker summary untuk SATU hari spesifik di market & segmen investor
+    tertentu (RG/NG/TN x all/f/d). Di-cache permanen per (code, day, market,
+    investor) -- data historis harian tidak pernah berubah, jadi TTL tidak
+    relevan (beda dari fetch_broker_summary yang agregat multi-hari & selalu
+    market RG dengan cutoff EOD).
     """
     day_str = day.isoformat()
-    key = f"{code}|dailysum|{market}|{day_str}"
+    key = f"{code}|dailysum|{market}|{investor}|{day_str}"
     payload, fetched_at = db_get_kv(key)
     if payload and fetched_at:
         return pd.read_json(io.StringIO(payload)) if payload != "[]" else pd.DataFrame()
@@ -968,7 +1014,7 @@ def fetch_daily_broker_summary(code: str, day: date, market: str = "RG"):
     try:
         r = requests.get(
             f"{BASE_URL}/analysis/summary/stock/{code}",
-            params={"from": day_str, "to": day_str, "investor": "all", "market": market},
+            params={"from": day_str, "to": day_str, "investor": investor, "market": market},
             headers={"Authorization": f"Bearer {api_key}"}, timeout=30,
         )
     except requests.RequestException:
@@ -980,10 +1026,61 @@ def fetch_daily_broker_summary(code: str, day: date, market: str = "RG"):
     if not data:
         return pd.DataFrame()
     df = pd.DataFrame(data)
-    for col in ["buy_volume", "sell_volume"]:
+    for col in ["buy_volume", "sell_volume", "buy_value", "sell_value", "buy_freq", "sell_freq"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
     return df
+
+
+def fetch_flow_summary(code: str, days: int = 10):
+    """
+    Flow harian 10 hari: Foreign Flow (investor=f), Ritel Flow & Big Money
+    Flow (investor=d, dipecah pakai build_broker_category_map). Porting
+    panel 'Flow Summary' FlowTracker. ~2 panggilan API per hari (f & d).
+    """
+    df_price = fetch_daily_chart(code, days + 5)
+    if df_price is None or df_price.empty:
+        return None
+    last_dates = df_price["date"].tail(days).tolist()
+
+    category = build_broker_category_map(code, window=max(days * 2, 60))
+
+    rows = []
+    for d in last_dates:
+        foreign_df = fetch_daily_broker_summary(code, d, market="RG", investor="f")
+        domestic_df = fetch_daily_broker_summary(code, d, market="RG", investor="d")
+
+        foreign_net = 0.0
+        if foreign_df is not None and not foreign_df.empty and "buy_value" in foreign_df.columns:
+            foreign_net = float((foreign_df["buy_value"] - foreign_df["sell_value"]).sum())
+
+        retail_net, bigmoney_net = 0.0, 0.0
+        if domestic_df is not None and not domestic_df.empty and "buy_value" in domestic_df.columns:
+            dd = domestic_df.copy()
+            dd["net_val"] = dd["buy_value"] - dd["sell_value"]
+            dd["segment"] = dd["code"].astype(str).map(category).fillna("RETAIL")
+            retail_net = float(dd.loc[dd["segment"] == "RETAIL", "net_val"].sum())
+            bigmoney_net = float(dd.loc[dd["segment"] == "BIG MONEY", "net_val"].sum())
+
+        rows.append({"date": d, "foreign": foreign_net, "ritel": retail_net, "big_money": bigmoney_net})
+
+    return pd.DataFrame(rows)
+
+
+def plot_flow_summary(flow_df: pd.DataFrame):
+    """3 bar chart terpisah: Foreign Flow, Ritel Flow, Big Money Flow -- ala FlowTracker."""
+    fig, axes = plt.subplots(3, 1, figsize=(11, 8), sharex=True)
+    panels = [("foreign", "Foreign Flow", "#8e44ad"), ("ritel", "Ritel Flow", "#e67e22"),
+              ("big_money", "Big Money Flow", "#2980b9")]
+    for ax, (col, title, color) in zip(axes, panels):
+        colors = ["#2ecc71" if v >= 0 else "#e74c3c" for v in flow_df[col]]
+        ax.bar(flow_df["date"].astype(str), flow_df[col], color=colors, alpha=0.85)
+        ax.axhline(0, color="#333", lw=0.8)
+        ax.set_title(title, fontsize=10, loc="left")
+        ax.grid(alpha=0.2, axis="y")
+    plt.xticks(rotation=45, ha="right", fontsize=8)
+    fig.tight_layout()
+    return fig
 
 
 def fetch_ng_daily_summary(code: str, day: date):
@@ -2120,13 +2217,27 @@ def plot_shareholder_relation(relation_data: dict, root_code: str):
 # ("Broker Trend" & "Broker Tracker/Inventory Flow") dari SATU panggilan
 # inventory-chart/stock yang sama dipakai Flow Analyzer & Accum. Streak.
 # --------------------------------------------------------------------------
-def plot_broker_trend_heatmap(net_pivot: pd.DataFrame, top_n: int = 15):
-    """Heatmap broker x tanggal, hijau=akumulasi/merah=distribusi/abu=netral."""
+def plot_broker_trend_heatmap(net_pivot: pd.DataFrame, top_n: int = 15, category: dict | None = None,
+                               category_filter: str | None = None):
+    """
+    Heatmap broker x tanggal, hijau=akumulasi/merah=distribusi/abu=netral.
+    category_filter: None (semua) / "FOREIGN" / "BIG MONEY" / "RETAIL" --
+    tombol toggle ala FlowTracker Broker Trend (kategori dari
+    build_broker_category_map(), proxy heuristik -- lihat catatan di sana).
+    """
     if net_pivot.empty:
         return None
-    magnitude = net_pivot.abs().sum(axis=1).sort_values(ascending=False)
+    pivot = net_pivot
+    if category and category_filter:
+        keep = [b for b in pivot.index if category.get(str(b), "RETAIL") == category_filter]
+        if not keep:
+            return None
+        pivot = pivot.loc[keep]
+    magnitude = pivot.abs().sum(axis=1).sort_values(ascending=False)
     top_brokers = magnitude.head(top_n).index
-    mat = net_pivot.loc[top_brokers]
+    mat = pivot.loc[top_brokers]
+    if mat.empty:
+        return None
 
     fig, ax = plt.subplots(figsize=(12, max(4, 0.35 * len(top_brokers))))
     vmax = mat.abs().max().max() or 1
@@ -2178,6 +2289,112 @@ def inventory_flow_summary(net_pivot: pd.DataFrame, price_df: pd.DataFrame, brok
         "cumulative_net": float(current), "peak_net": float(peak),
         "unrealized_pl_pct": unrealized_pl_pct,
     }
+
+
+def plot_broker_action(net_pivot: pd.DataFrame, price_df: pd.DataFrame, brokers: list):
+    """
+    Overlay net value KUMULATIF beberapa broker pilihan vs harga saham --
+    porting panel 'Broker Action' FlowTracker (dua sumbu-Y: net value kiri,
+    harga kanan).
+    """
+    if net_pivot.empty or not brokers:
+        return None
+    fig, ax1 = plt.subplots(figsize=(12, 5))
+    ax2 = ax1.twinx()
+
+    colors = plt.cm.tab10.colors
+    for i, b in enumerate(brokers):
+        if b not in net_pivot.index:
+            continue
+        cum = net_pivot.loc[b].fillna(0).cumsum()
+        ax1.plot(cum.index, cum.values, label=b, color=colors[i % len(colors)], lw=1.8)
+
+    if not price_df.empty:
+        ax2.plot(price_df["date"], price_df["close"], color="#333", lw=1.2, ls="--", label="Harga")
+
+    ax1.set_ylabel("Net Value Kumulatif")
+    ax2.set_ylabel("Harga")
+    ax1.axhline(0, color="#999", lw=0.6)
+    ax1.legend(loc="upper left", fontsize=8)
+    ax2.legend(loc="upper right", fontsize=8)
+    ax1.set_title("Broker Action — Net Value Kumulatif vs Harga")
+    ax1.grid(alpha=0.2)
+    fig.autofmt_xdate()
+    return fig
+
+
+# --------------------------------------------------------------------------
+# BROKER TRACKER -- bandingkan dua rentang tanggal (Alpha=lama, Beta=baru)
+# per broker, gauge Big Dist<->Big Acc, tabel Inventory Flow (delta +
+# sinyal). Porting panel 'Broker Tracker' FlowTracker.
+# --------------------------------------------------------------------------
+def broker_tracker_table(net_pivot: pd.DataFrame, price_df: pd.DataFrame, category: dict,
+                          alpha_range: tuple, beta_range: tuple, top_n: int = 10):
+    """
+    Untuk tiap broker signifikan: net value di Range Alpha, Range Beta,
+    delta antara keduanya, dan status/sinyal (dari inventory_flow_summary
+    dibatasi sampai akhir Range Beta).
+    """
+    if net_pivot.empty:
+        return pd.DataFrame(), 0.0
+
+    alpha_cols = [c for c in net_pivot.columns if alpha_range[0] <= c <= alpha_range[1]]
+    beta_cols = [c for c in net_pivot.columns if beta_range[0] <= c <= beta_range[1]]
+    if not alpha_cols or not beta_cols:
+        return pd.DataFrame(), 0.0
+
+    alpha_net = net_pivot[alpha_cols].sum(axis=1)
+    beta_net = net_pivot[beta_cols].sum(axis=1)
+    combined_mag = (alpha_net.abs() + beta_net.abs()).sort_values(ascending=False)
+    top_brokers = combined_mag.head(top_n).index
+
+    price_upto_beta = price_df[price_df["date"] <= beta_range[1]]
+
+    rows = []
+    for b in top_brokers:
+        delta = float(beta_net.get(b, 0) - alpha_net.get(b, 0))
+        flow = inventory_flow_summary(
+            net_pivot[[c for c in net_pivot.columns if c <= beta_range[1]]], price_upto_beta, b
+        )
+        signal = "-"
+        if flow:
+            signal = f"{flow['exit_pct']:.0f}% EXIT" if flow["exit_pct"] > 5 else f"{flow['unrealized_pl_pct']:+.2f}% P/L"
+        rows.append({
+            "broker": b, "kategori": category.get(str(b), "-"),
+            "alpha": float(alpha_net.get(b, 0)), "beta": float(beta_net.get(b, 0)),
+            "delta": delta, "signal": signal,
+        })
+
+    df = pd.DataFrame(rows).sort_values("delta", ascending=False)
+
+    # Gauge Big Dist <-> Big Acc: delta bersih broker BIG MONEY saja,
+    # dinormalisasi ke total |net| Big Money supaya berada di rentang wajar.
+    big_rows = df[df["kategori"] == "BIG MONEY"]
+    if not big_rows.empty:
+        total_abs = (big_rows["alpha"].abs() + big_rows["beta"].abs()).sum()
+        gauge_score = (big_rows["delta"].sum() / total_abs * 100) if total_abs else 0.0
+    else:
+        gauge_score = 0.0
+
+    return df, gauge_score
+
+
+def plot_dist_acc_gauge(score: float):
+    """Gauge horizontal BIG DIST (-100) <-> BIG ACC (+100)."""
+    fig, ax = plt.subplots(figsize=(8, 1.3))
+    ax.barh([0], [200], left=-100, color="#eee", height=0.5)
+    color = "#2ecc71" if score >= 0 else "#e74c3c"
+    ax.barh([0], [score], left=0 if score >= 0 else score, color=color, height=0.5)
+    ax.axvline(0, color="#333", lw=1)
+    ax.set_xlim(-100, 100)
+    ax.set_yticks([])
+    ax.text(-98, 0.6, "BIG DIST", fontsize=9, color="#e74c3c", va="bottom")
+    ax.text(70, 0.6, "BIG ACC", fontsize=9, color="#2ecc71", va="bottom")
+    ax.text(0, -0.9, f"{score:+.2f}%", ha="center", fontsize=11, fontweight="bold")
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    fig.tight_layout()
+    return fig
 
 
 # --------------------------------------------------------------------------
@@ -2396,18 +2613,53 @@ if mode == "Analisis Satu Saham":
             else:
                 st.caption("Data broker tidak cukup / endpoint butuh paket tertentu.")
 
-        st.subheader("🌡️ Broker Trend Heatmap & Inventory Flow")
+        st.subheader("📶 Flow Summary (10 Hari Terakhir)")
+        st.caption(
+            "Foreign Flow dari investor=f (asing, resmi). Ritel/Big Money Flow "
+            "adalah PROXY: broker domestik dipecah berdasarkan rata-rata nilai "
+            "per transaksi (di atas Rp50 juta dianggap Big Money) — InvezGo "
+            "tidak punya kategori ritel/institusi native, jadi ini estimasi."
+        )
+        with st.spinner("Menghitung Flow Summary…"):
+            flow_summary_df = fetch_flow_summary(ticker)
+        if flow_summary_df is not None and not flow_summary_df.empty:
+            st.pyplot(plot_flow_summary(flow_summary_df), use_container_width=True)
+        else:
+            st.caption("Data flow summary tidak tersedia / endpoint butuh paket tertentu.")
+
+        st.subheader("🌡️ Broker Trend Heatmap, Broker Action & Inventory Flow")
         st.caption(
             "Porting drill-down 'Broker Trend' & 'Broker Tracker' FlowTracker: "
             "heatmap net value harian per broker 30 hari terakhir (hijau=net "
-            "beli, merah=net jual), plus estimasi harga rata-rata masuk & "
-            "status exit broker akumulator terbesar."
+            "beli, merah=net jual), overlay net value beberapa broker vs "
+            "harga, plus estimasi harga rata-rata masuk & status exit."
         )
         inv_data = fetch_inventory_chart_stock(ticker, days=35)
         if inv_data:
             price_df, net_pivot = inventory_to_frames(inv_data)
             if not net_pivot.empty:
-                st.pyplot(plot_broker_trend_heatmap(net_pivot), use_container_width=True)
+                category_map = build_broker_category_map(ticker)
+
+                cat_choice = st.radio(
+                    "Filter kategori broker", ["Semua", "Retail", "Big Money", "Foreign"],
+                    horizontal=True, key="broker_trend_cat",
+                )
+                cat_filter = {"Semua": None, "Retail": "RETAIL", "Big Money": "BIG MONEY", "Foreign": "FOREIGN"}[cat_choice]
+                heatmap_fig = plot_broker_trend_heatmap(net_pivot, category=category_map, category_filter=cat_filter)
+                if heatmap_fig:
+                    st.pyplot(heatmap_fig, use_container_width=True)
+                else:
+                    st.caption(f"Tidak ada broker kategori '{cat_choice}' yang aktif di periode ini.")
+
+                st.markdown("**Broker Action** — pilih broker untuk overlay vs harga")
+                default_brokers = net_pivot.abs().sum(axis=1).sort_values(ascending=False).head(3).index.tolist()
+                chosen_brokers = st.multiselect(
+                    "Broker", options=list(net_pivot.index), default=default_brokers, key="broker_action_pick"
+                )
+                if chosen_brokers:
+                    action_fig = plot_broker_action(net_pivot, price_df, chosen_brokers)
+                    if action_fig:
+                        st.pyplot(action_fig, use_container_width=True)
 
                 magnitude = net_pivot.sum(axis=1).sort_values(ascending=False)
                 top_accum_broker = magnitude.index[0] if not magnitude.empty else None
@@ -2426,6 +2678,44 @@ if mode == "Analisis Satu Saham":
                             "net-beli harian), BUKAN harga transaksi riil broker — endpoint "
                             "tidak menyediakan average price per transaksi per broker."
                         )
+
+                st.markdown("### 🎚️ Broker Tracker — Bandingkan Dua Rentang Tanggal")
+                st.caption(
+                    "Range Alpha (lama) vs Range Beta (baru): siapa yang tadinya "
+                    "distribusi lalu balik akumulasi (atau sebaliknya)."
+                )
+                all_dates = sorted(net_pivot.columns)
+                if len(all_dates) >= 4:
+                    mid = len(all_dates) // 2
+                    tc1, tc2 = st.columns(2)
+                    with tc1:
+                        st.caption("**Range Alpha (lama)**")
+                        a_from = st.date_input("Dari", all_dates[0], key="alpha_from")
+                        a_to = st.date_input("Sampai", all_dates[mid - 1], key="alpha_to")
+                    with tc2:
+                        st.caption("**Range Beta (baru)**")
+                        b_from = st.date_input("Dari", all_dates[mid], key="beta_from")
+                        b_to = st.date_input("Sampai", all_dates[-1], key="beta_to")
+
+                    tracker_df, gauge_score = broker_tracker_table(
+                        net_pivot, price_df, category_map, (a_from, a_to), (b_from, b_to)
+                    )
+                    if not tracker_df.empty:
+                        st.pyplot(plot_dist_acc_gauge(gauge_score), use_container_width=True)
+                        disp = tracker_df.copy()
+                        for c in ["alpha", "beta", "delta"]:
+                            disp[c] = disp[c].apply(id_number)
+                        disp.columns = ["Broker", "Kategori", "Alpha", "Beta", "Beta Δ", "Signal"]
+                        st.dataframe(disp, use_container_width=True, hide_index=True)
+                        st.caption(
+                            "Gauge Big Dist↔Big Acc dihitung dari delta net broker kategori "
+                            "'Big Money' saja, dinormalisasi ke total |net| mereka — proxy, "
+                            "bukan skor resmi bursa."
+                        )
+                    else:
+                        st.caption("Tidak cukup data broker di kedua rentang untuk perbandingan.")
+                else:
+                    st.caption("Data historis belum cukup untuk membagi dua rentang tanggal.")
             else:
                 st.caption("Data inventory broker tidak cukup untuk membuat heatmap.")
         else:

@@ -946,6 +946,94 @@ def fetch_stock_posts(code: str, limit: int = 10):
     return items, None
 
 
+# --------------------------------------------------------------------------
+# FUNDAMENTAL: laporan keuangan (IS/BS/CF) + key statistics/valuasi
+# --------------------------------------------------------------------------
+FINANCIAL_CACHE_TTL_HOURS = 24
+
+
+def _fetch_financial_rows(url: str, code: str, params: dict, cache_key: str):
+    """Helper generik: GET endpoint berformat {rows, columns}, cache di kv_cache."""
+    payload, fetched_at = db_get_kv(cache_key)
+    if payload and fetched_at:
+        try:
+            age_hours = (_wib_now() - _dt.fromisoformat(fetched_at)).total_seconds() / 3600
+            if age_hours < FINANCIAL_CACHE_TTL_HOURS:
+                return json.loads(payload), None
+        except (ValueError, TypeError, json.JSONDecodeError):
+            pass
+
+    api_key = get_secret("INVEZGO_API_KEY")
+    try:
+        r = requests.get(url, params=params, headers={"Authorization": f"Bearer {api_key}"}, timeout=30)
+    except requests.RequestException as e:
+        cached = json.loads(payload) if payload else None
+        return cached, f"Request error: {e}"
+    if r.status_code == 204:
+        return None, None
+    if not r.ok:
+        cached = json.loads(payload) if payload else None
+        hint = _STATUS_HINT.get(r.status_code, f"{r.status_code}")
+        return cached, f"GET {url} -> {hint} | body: {r.text[:300]}"
+    try:
+        data = r.json()
+    except ValueError:
+        return None, f"GET {url} -> 200 OK tapi bukan JSON valid."
+    if not data or not data.get("rows"):
+        return None, None
+    db_set_kv(cache_key, json.dumps(data), _wib_now().isoformat())
+    return data, None
+
+
+def fetch_financial_statement(code: str, statement: str = "IS", period_type: str = "Q", limit: int = 8):
+    """
+    Laporan keuangan mentah. statement: IS (laba rugi) / BS (neraca) / CF (arus kas).
+    Endpoint: GET /analysis/financial-statement/{code} -- verified api-1.json.
+    """
+    url = f"{BASE_URL}/analysis/financial-statement/{code}"
+    key = f"{code}|finstat|{statement}|{period_type}|{limit}"
+    return _fetch_financial_rows(url, code, {"statement": statement, "type": period_type, "limit": limit}, key)
+
+
+def fetch_keystat(code: str, period_type: str = "Q", limit: int = 8):
+    """
+    Key statistics / rasio valuasi (PER, PBV, ROE, dll).
+    Endpoint: GET /analysis/keystat/{code} -- verified api-1.json.
+    CATATAN dari deskripsi resmi API: "Endpoint ini sedang mengalami proses
+    aktualisasi untuk perhitungan yang lebih akurat. Data yang disajikan
+    saat ini mungkin kurang tepat" -- jadi tampilkan apa adanya dengan
+    disclaimer, jangan dianggap presisi.
+    """
+    url = f"{BASE_URL}/analysis/keystat/{code}"
+    key = f"{code}|keystat|{period_type}|{limit}"
+    return _fetch_financial_rows(url, code, {"type": period_type, "limit": limit}, key)
+
+
+def rows_to_pivot(data: dict) -> pd.DataFrame:
+    """Ubah {rows:[{name, values:[{col, amount}]}], columns:[{label}]} jadi tabel lebar name x periode."""
+    if not data or not data.get("rows"):
+        return pd.DataFrame()
+    col_order = [c["label"] for c in data.get("columns", [])]
+    records = {}
+    for row in data["rows"]:
+        vals = {v["col"]: v["amount"] for v in row.get("values", [])}
+        records[row["name"]] = vals
+    df = pd.DataFrame.from_dict(records, orient="index")
+    cols_present = [c for c in col_order if c in df.columns]
+    return df[cols_present] if cols_present else df
+
+
+def find_metric_row(pivot_df: pd.DataFrame, keywords: list):
+    """Cari baris pertama yang namanya mengandung salah satu keyword (case-insensitive)."""
+    if pivot_df.empty:
+        return None
+    for idx in pivot_df.index:
+        low = str(idx).lower()
+        if any(kw in low for kw in keywords):
+            return idx
+    return None
+
+
 def broker_top3_accumulate(summary: pd.DataFrame):
     """
     Filter '3 broker teratas ngumpulin, broker #1 >= 2x broker #2'.
@@ -1589,235 +1677,303 @@ if mode == "Analisis Satu Saham":
 
     low_p, high_p = anchor[0][1], anchor[1][1]
     retr, ext = fib_map(low_p, high_p)
-
-    st.subheader("🎯 Target Fibonacci (retracement & extension)")
-    tbl = pd.DataFrame(
-        {
-            "Level": [f"{l*100:.1f}%" for l in FIB_LEVELS] + [f"{l*100:.1f}%" for l in FIB_EXT],
-            "Jenis": ["Retracement"] * len(FIB_LEVELS) + ["Extension"] * len(FIB_EXT),
-            "Harga": [retr[l] for l in FIB_LEVELS] + [ext[l] for l in FIB_EXT],
-        }
-    )
-    tbl["Jarak dari harga sekarang"] = (
-        ((tbl["Harga"] / current_price - 1) * 100).round(2).astype(str) + " %"
-    )
-    st.dataframe(tbl, use_container_width=True, hide_index=True)
-
-    st.subheader("🚦 Sinyal & Rencana Trading")
     sig, _, _ = analyze_signal(df, low_p, high_p, max_risk)
-    sc1, sc2, sc3 = st.columns(3)
-    sc1.metric("Sinyal", sig["signal"])
-    sc2.metric("Level Fib Terkait", sig["fib_level"])
-    sc3.metric("Risiko", f"{sig['risk_pct']:.2f}%")
 
-    if sig["entry"]:
-        e1, e2, e3, e4, e5 = st.columns(5)
-        e1.metric("Entry", f"{sig['entry']:,.0f}")
-        e2.metric("Stop Loss", f"{sig['stop_loss']:,.0f}", delta=f"-{sig['risk_pct']:.1f}%")
-        e3.metric("TP1 (1:1)", f"{sig['tp1']:,.0f}")
-        e4.metric("TP2", f"{sig['tp2']:,.0f}")
-        e5.metric("TP3 (ext 161.8%)", f"{sig['tp3']:,.0f}")
-        rr = (sig["tp1"] - sig["entry"]) / max(sig["entry"] - sig["stop_loss"], 1e-9)
-        st.caption(f"Risk : Reward TP1 ≈ 1 : {rr:.2f}")
-
-    st.subheader("📊 Chart")
-    st.pyplot(plot_chart(df, retr, low_p, high_p), use_container_width=True)
-
-    # --- Volume 30 hari terakhir ---
-    st.subheader("📶 Volume 30 Hari Terakhir")
-    vol_seg = df.tail(30)
-    vol_avg30 = float(vol_seg["volume"].mean())
-    vol_today = float(df["volume"].iloc[-1])
-    avg_recent10 = float(df["volume"].tail(10).mean())
-    avg_prior20 = float(df["volume"].tail(30).head(20).mean()) if len(df) >= 30 else avg_recent10
-    trend = "MENINGKAT" if avg_recent10 > avg_prior20 * 1.1 else (
-        "MENURUN" if avg_recent10 < avg_prior20 * 0.9 else "STABIL"
+    tab_teknikal, tab_bandarmologi, tab_fundamental = st.tabs(
+        ["📐 Teknikal", "🕵️ Bandarmologi", "📊 Fundamental"]
     )
-    v1, v2, v3, v4 = st.columns(4)
-    v1.metric("Volume Hari Ini", f"{vol_today:,.0f}")
-    v2.metric("Rata-rata 30 Hari", f"{vol_avg30:,.0f}")
-    v3.metric("Vol Hari Ini vs Rata-rata", f"{vol_today / vol_avg30:.2f}x" if vol_avg30 else "-")
-    v4.metric("Tren 10h Terakhir", trend)
-    st.pyplot(plot_volume_30d(df), use_container_width=True)
 
-    # --- Info bandar untuk saham ini ---
-    bdm = fetch_bdm(ticker, lookback)
-    if bdm is not None and not bdm.empty:
-        st.subheader("🕵️ Aktivitas Bandar (BDM)")
-        info = bandar_classify(df, bdm)
-        if info:
-            b1, b2, b3, b4 = st.columns(4)
-            b1.metric("Stage", info["stage"])
-            b2.metric("Hari Akumulasi", f"{info['acc_pct']:.0f}%")
-            b3.metric("Volume vs MA20", f"{info['vol_ratio']:.2f}x")
-            b4.metric("Lebar Range 40h", f"{info['range_pct']:.1f}%")
-        st.pyplot(plot_bandar(df, bdm), use_container_width=True)
-
-    # --- Top-3 broker akumulasi ---
-    with st.expander("🏦 Top 3 Broker (net akumulasi 20 hari)"):
-        bsum = fetch_broker_summary(ticker, 20)
-        binfo = broker_top3_accumulate(bsum)
-        if binfo:
-            bb1, bb2, bb3, bb4 = st.columns(4)
-            bb1.metric(f"#1 {binfo['b1']}", f"{binfo['net1']:,.0f}")
-            bb2.metric(f"#2 {binfo['b2']}", f"{binfo['net2']:,.0f}")
-            bb3.metric(f"#3 {binfo['b3']}", f"{binfo['net3']:,.0f}")
-            bb4.metric("Rasio #1:#2", f"{binfo['ratio_1v2']:.2f}x",
-                       delta="LOLOS" if binfo["broker_filter_pass"] else "GAGAL")
-        else:
-            st.caption("Data broker tidak cukup / endpoint butuh paket tertentu.")
-
-    # --- Bandar yang sedang mengumpulkan ---
-    st.subheader("🧲 Bandar yang Sedang Mengumpulkan")
-    trend_info = top_accumulator_trend(ticker)
-    if trend_info:
-        active = trend_info["still_active"]
-        t1, t2, t3 = st.columns(3)
-        t1.metric("Broker Akumulator Terbesar (30h)", trend_info["broker"],
-                   delta=f"net {trend_info['net_30d']:,.0f}")
-        t2.metric("Net 10 Hari Terakhir", f"{trend_info['net_10d']:,.0f}",
-                   delta=f"{trend_info['share_recent']*100:.0f}% dari net 30h")
-        t3.metric("Status", trend_info["verdict"],
-                   delta="AKTIF" if active else "MELAMBAT", delta_color="normal" if active else "inverse")
-        st.caption(
-            "Dihitung dari net beli–jual (bukan net volume kumulatif harian) per broker "
-            "di endpoint summary. 'MASIH AKTIF' berarti broker akumulator terbesar 30 hari "
-            "masih menyumbang porsi besar (≥20%) dari net-nya di 10 hari terakhir — bukan "
-            "cuma sisa net lama yang sudah berhenti dibeli."
+    # ======================================================================
+    # TAB TEKNIKAL — fibonacci, sinyal, chart, volume
+    # ======================================================================
+    with tab_teknikal:
+        st.subheader("🎯 Target Fibonacci (retracement & extension)")
+        tbl = pd.DataFrame(
+            {
+                "Level": [f"{l*100:.1f}%" for l in FIB_LEVELS] + [f"{l*100:.1f}%" for l in FIB_EXT],
+                "Jenis": ["Retracement"] * len(FIB_LEVELS) + ["Extension"] * len(FIB_EXT),
+                "Harga": [retr[l] for l in FIB_LEVELS] + [ext[l] for l in FIB_EXT],
+            }
         )
-    else:
-        st.caption("Tidak ada broker dengan net akumulasi positif dalam 30 hari terakhir, atau data broker tidak cukup.")
-
-    # --- Kepemilikan: shareholder & insider ---
-    st.subheader("🏛️ Kepemilikan (Shareholder & Insider)")
-    st.caption(
-        "Porting dari konsep skill analisa-kepemilikan: komposisi terbaru, riwayat "
-        "bulanan, graf relasi, rekonsiliasi insider↔broker pasar negosiasi (NG), "
-        "dirangkai jadi timeline. TIDAK menelusuri rantai korporasi berjenjang "
-        "(endpoint relation cuma punya irisan kepemilikan, bukan edge entity→entity) "
-        "dan TIDAK menyisir seluruh pasar NG tanpa laporan insider (butuh 1 panggilan "
-        "API per hari dalam window — terlalu berat untuk app live)."
-    )
-    sh_col, ins_col = st.columns(2)
-
-    with sh_col:
-        st.markdown("**Komposisi Pemegang Saham (>1%, snapshot terbaru)**")
-        shareholders, sh_err = fetch_shareholders(ticker)
-        if shareholders is not None and not shareholders.empty:
-            show_cols = [c for c in ["name", "percentage", "badge"] if c in shareholders.columns]
-            st.dataframe(
-                shareholders[show_cols] if show_cols else shareholders,
-                use_container_width=True, hide_index=True, height=280,
-            )
-        elif sh_err:
-            st.error(f"❌ Shareholder gagal diambil: {sh_err}")
-        else:
-            st.caption("Tidak ada data shareholder untuk ticker ini.")
-
-    with ins_col:
-        st.markdown(f"**Transaksi Insider ({INSIDER_LOOKBACK_MONTHS} bulan terakhir)**")
-        insider_df, ins_err = fetch_insider_transactions(ticker)
-        if insider_df is not None and not insider_df.empty:
-            verdict = insider_verdict(insider_df)
-            if verdict and verdict["count"] > 0:
-                st.metric(
-                    "Verdict 90 hari terakhir", verdict["verdict"],
-                    delta=f"{verdict['count']} transaksi",
-                )
-            show_cols = [c for c in ["date", "name", "badge", "action", "volume", "price"] if c in insider_df.columns]
-            st.dataframe(
-                insider_df[show_cols] if show_cols else insider_df,
-                use_container_width=True, hide_index=True, height=230,
-            )
-        elif ins_err:
-            st.error(f"❌ Insider gagal diambil: {ins_err}")
-        else:
-            st.caption("Tidak ada laporan insider dalam periode ini.")
-
-    with st.expander("🕸️ Graf Relasi Kepemilikan"):
-        st.caption(
-            "Irisan kepemilikan (siapa memegang saham yang sama) — BUKAN rantai "
-            "korporasi berjenjang. Merah = saham ini, biru = entitas/saham terkait."
+        tbl["Jarak dari harga sekarang"] = (
+            ((tbl["Harga"] / current_price - 1) * 100).round(2).astype(str) + " %"
         )
-        relation_data, rel_err = fetch_shareholder_relation(ticker)
-        if relation_data:
-            st.pyplot(plot_shareholder_relation(relation_data, ticker), use_container_width=True)
-        elif rel_err:
-            st.error(f"❌ Graf relasi gagal diambil: {rel_err}")
-        else:
-            st.caption("Tidak ada relasi kepemilikan >1% yang ditemukan untuk ticker ini.")
+        st.dataframe(tbl, use_container_width=True, hide_index=True)
 
-    with st.expander("📜 Riwayat Bulanan Pemegang >1% (perubahan signifikan)"):
-        detail_df, det_err = fetch_shareholder_detail(ticker)
-        if det_err:
-            st.error(f"❌ Riwayat shareholder gagal diambil: {det_err}")
-        elif detail_df is not None and not detail_df.empty:
-            changes = shareholder_monthly_changes(detail_df)
-            if not changes.empty:
-                st.dataframe(changes, use_container_width=True, hide_index=True, height=250)
+        st.subheader("🚦 Sinyal & Rencana Trading")
+        sc1, sc2, sc3 = st.columns(3)
+        sc1.metric("Sinyal", sig["signal"])
+        sc2.metric("Level Fib Terkait", sig["fib_level"])
+        sc3.metric("Risiko", f"{sig['risk_pct']:.2f}%")
+
+        if sig["entry"]:
+            e1, e2, e3, e4, e5 = st.columns(5)
+            e1.metric("Entry", f"{sig['entry']:,.0f}")
+            e2.metric("Stop Loss", f"{sig['stop_loss']:,.0f}", delta=f"-{sig['risk_pct']:.1f}%")
+            e3.metric("TP1 (1:1)", f"{sig['tp1']:,.0f}")
+            e4.metric("TP2", f"{sig['tp2']:,.0f}")
+            e5.metric("TP3 (ext 161.8%)", f"{sig['tp3']:,.0f}")
+            rr = (sig["tp1"] - sig["entry"]) / max(sig["entry"] - sig["stop_loss"], 1e-9)
+            st.caption(f"Risk : Reward TP1 ≈ 1 : {rr:.2f}")
+
+        st.subheader("📊 Chart")
+        st.pyplot(plot_chart(df, retr, low_p, high_p), use_container_width=True)
+
+        st.subheader("📶 Volume 30 Hari Terakhir")
+        vol_seg = df.tail(30)
+        vol_avg30 = float(vol_seg["volume"].mean())
+        vol_today = float(df["volume"].iloc[-1])
+        avg_recent10 = float(df["volume"].tail(10).mean())
+        avg_prior20 = float(df["volume"].tail(30).head(20).mean()) if len(df) >= 30 else avg_recent10
+        vtrend = "MENINGKAT" if avg_recent10 > avg_prior20 * 1.1 else (
+            "MENURUN" if avg_recent10 < avg_prior20 * 0.9 else "STABIL"
+        )
+        v1, v2, v3, v4 = st.columns(4)
+        v1.metric("Volume Hari Ini", f"{vol_today:,.0f}")
+        v2.metric("Rata-rata 30 Hari", f"{vol_avg30:,.0f}")
+        v3.metric("Vol Hari Ini vs Rata-rata", f"{vol_today / vol_avg30:.2f}x" if vol_avg30 else "-")
+        v4.metric("Tren 10h Terakhir", vtrend)
+        st.pyplot(plot_volume_30d(df), use_container_width=True)
+
+    # ======================================================================
+    # TAB BANDARMOLOGI — BDM, broker, kepemilikan/insider, sentimen komunitas
+    # ======================================================================
+    with tab_bandarmologi:
+        bdm = fetch_bdm(ticker, lookback)
+        if bdm is not None and not bdm.empty:
+            st.subheader("🕵️ Aktivitas Bandar (BDM)")
+            bdm_info = bandar_classify(df, bdm)
+            if bdm_info:
+                b1, b2, b3, b4 = st.columns(4)
+                b1.metric("Stage", bdm_info["stage"])
+                b2.metric("Hari Akumulasi", f"{bdm_info['acc_pct']:.0f}%")
+                b3.metric("Volume vs MA20", f"{bdm_info['vol_ratio']:.2f}x")
+                b4.metric("Lebar Range 40h", f"{bdm_info['range_pct']:.1f}%")
+            st.pyplot(plot_bandar(df, bdm), use_container_width=True)
+
+        with st.expander("🏦 Top 3 Broker (net akumulasi 20 hari)"):
+            bsum = fetch_broker_summary(ticker, 20)
+            binfo = broker_top3_accumulate(bsum)
+            if binfo:
+                bb1, bb2, bb3, bb4 = st.columns(4)
+                bb1.metric(f"#1 {binfo['b1']}", f"{binfo['net1']:,.0f}")
+                bb2.metric(f"#2 {binfo['b2']}", f"{binfo['net2']:,.0f}")
+                bb3.metric(f"#3 {binfo['b3']}", f"{binfo['net3']:,.0f}")
+                bb4.metric("Rasio #1:#2", f"{binfo['ratio_1v2']:.2f}x",
+                           delta="LOLOS" if binfo["broker_filter_pass"] else "GAGAL")
             else:
-                st.caption("Tidak ada perubahan kepemilikan signifikan (≥0.1 poin persen) antar-bulan.")
-        else:
-            st.caption("Tidak ada riwayat bulanan untuk ticker ini.")
+                st.caption("Data broker tidak cukup / endpoint butuh paket tertentu.")
 
-    with st.expander("🔍 Rekonsiliasi Insider ↔ Broker Pasar Negosiasi (NG)"):
+        st.subheader("🧲 Bandar yang Sedang Mengumpulkan")
+        trend_info = top_accumulator_trend(ticker)
+        if trend_info:
+            active = trend_info["still_active"]
+            t1, t2, t3 = st.columns(3)
+            t1.metric("Broker Akumulator Terbesar (30h)", trend_info["broker"],
+                       delta=f"net {trend_info['net_30d']:,.0f}")
+            t2.metric("Net 10 Hari Terakhir", f"{trend_info['net_10d']:,.0f}",
+                       delta=f"{trend_info['share_recent']*100:.0f}% dari net 30h")
+            t3.metric("Status", trend_info["verdict"],
+                       delta="AKTIF" if active else "MELAMBAT", delta_color="normal" if active else "inverse")
+            st.caption(
+                "Dihitung dari net beli–jual (bukan net volume kumulatif harian) per broker "
+                "di endpoint summary. 'MASIH AKTIF' berarti broker akumulator terbesar 30 hari "
+                "masih menyumbang porsi besar (≥20%) dari net-nya di 10 hari terakhir — bukan "
+                "cuma sisa net lama yang sudah berhenti dibeli."
+            )
+        else:
+            st.caption("Tidak ada broker dengan net akumulasi positif dalam 30 hari terakhir, atau data broker tidak cukup.")
+
+        st.subheader("🏛️ Kepemilikan (Shareholder & Insider)")
         st.caption(
-            "Untuk tiap transaksi insider, dicari broker NG di tanggal yang sama "
-            "dengan volume paling mendekati. Kalau tidak ketemu, transaksinya bisa "
-            "di market RG biasa (bukan NG) atau di luar bursa."
+            "Porting dari konsep skill analisa-kepemilikan: komposisi terbaru, riwayat "
+            "bulanan, graf relasi, rekonsiliasi insider↔broker pasar negosiasi (NG), "
+            "dirangkai jadi timeline. TIDAK menelusuri rantai korporasi berjenjang "
+            "(endpoint relation cuma punya irisan kepemilikan, bukan edge entity→entity) "
+            "dan TIDAK menyisir seluruh pasar NG tanpa laporan insider (butuh 1 panggilan "
+            "API per hari dalam window — terlalu berat untuk app live)."
         )
-        if insider_df is not None and not insider_df.empty:
-            recon = reconcile_insider_to_broker(ticker, insider_df)
-            st.dataframe(recon, use_container_width=True, hide_index=True, height=250)
-        else:
-            st.caption("Tidak ada transaksi insider untuk direkonsiliasi.")
+        sh_col, ins_col = st.columns(2)
 
-    with st.expander("🗓️ Timeline Kepemilikan Gabungan (Lapis A + B)"):
-        events = []
-        if det_err is None and detail_df is not None and not detail_df.empty:
-            changes = shareholder_monthly_changes(detail_df)
-            for _, row in changes.iterrows():
-                events.append({
-                    "date": row["date"], "lapis": "A — Struktur",
-                    "peristiwa": f"{row['name']}: {row['change']:+.2f}pp → {row['percent']:.2f}%",
-                })
-        if insider_df is not None and not insider_df.empty:
-            for _, row in insider_df.iterrows():
-                events.append({
-                    "date": row["date"], "lapis": "B — Insider",
-                    "peristiwa": f"{row.get('name')} {row.get('action')} {row.get('volume'):,.0f} lembar @ {row.get('price')}",
-                })
-        if events:
-            timeline = pd.DataFrame(events).sort_values("date", ascending=False).reset_index(drop=True)
-            st.dataframe(timeline, use_container_width=True, hide_index=True, height=300)
-        else:
-            st.caption("Tidak ada peristiwa kepemilikan (Lapis A/B) untuk dirangkai jadi timeline.")
+        with sh_col:
+            st.markdown("**Komposisi Pemegang Saham (>1%, snapshot terbaru)**")
+            shareholders, sh_err = fetch_shareholders(ticker)
+            if shareholders is not None and not shareholders.empty:
+                show_cols = [c for c in ["name", "percentage", "badge"] if c in shareholders.columns]
+                st.dataframe(
+                    shareholders[show_cols] if show_cols else shareholders,
+                    use_container_width=True, hide_index=True, height=280,
+                )
+            elif sh_err:
+                st.error(f"❌ Shareholder gagal diambil: {sh_err}")
+            else:
+                st.caption("Tidak ada data shareholder untuk ticker ini.")
 
-    # --- Berita / postingan komunitas ---
-    st.subheader("📰 Berita & Diskusi Terkini")
-    st.caption(
-        "InvezGo tidak menyediakan endpoint berita/wire resmi — ini postingan "
-        "komunitas dari platform InvezGo terkait saham ini. Perlakukan sebagai "
-        "sentimen komunitas, BUKAN berita tervalidasi dari media."
-    )
-    posts, posts_err = fetch_stock_posts(ticker)
-    if posts:
-        for p in posts:
-            title = p.get("title") or p.get("content", "")[:80] or "(tanpa judul)"
-            body = p.get("content") or p.get("body") or ""
-            author = p.get("author", {}).get("name") if isinstance(p.get("author"), dict) else p.get("author")
-            created = p.get("created_at") or p.get("date") or p.get("createdAt")
-            with st.container(border=True):
-                st.markdown(f"**{title}**")
-                if body and body != title:
-                    st.write(body[:400] + ("..." if len(body) > 400 else ""))
-                meta = " · ".join(str(x) for x in [author, created] if x)
-                if meta:
-                    st.caption(meta)
-    elif posts_err:
-        st.error(f"❌ Postingan gagal diambil: {posts_err}")
-    else:
-        st.caption("Tidak ada postingan komunitas untuk saham ini.")
+        with ins_col:
+            st.markdown(f"**Transaksi Insider ({INSIDER_LOOKBACK_MONTHS} bulan terakhir)**")
+            insider_df, ins_err = fetch_insider_transactions(ticker)
+            if insider_df is not None and not insider_df.empty:
+                verdict = insider_verdict(insider_df)
+                if verdict and verdict["count"] > 0:
+                    st.metric(
+                        "Verdict 90 hari terakhir", verdict["verdict"],
+                        delta=f"{verdict['count']} transaksi",
+                    )
+                show_cols = [c for c in ["date", "name", "badge", "action", "volume", "price"] if c in insider_df.columns]
+                st.dataframe(
+                    insider_df[show_cols] if show_cols else insider_df,
+                    use_container_width=True, hide_index=True, height=230,
+                )
+            elif ins_err:
+                st.error(f"❌ Insider gagal diambil: {ins_err}")
+            else:
+                st.caption("Tidak ada laporan insider dalam periode ini.")
+
+        with st.expander("🕸️ Graf Relasi Kepemilikan"):
+            st.caption(
+                "Irisan kepemilikan (siapa memegang saham yang sama) — BUKAN rantai "
+                "korporasi berjenjang. Merah = saham ini, biru = entitas/saham terkait."
+            )
+            relation_data, rel_err = fetch_shareholder_relation(ticker)
+            if relation_data:
+                st.pyplot(plot_shareholder_relation(relation_data, ticker), use_container_width=True)
+            elif rel_err:
+                st.error(f"❌ Graf relasi gagal diambil: {rel_err}")
+            else:
+                st.caption("Tidak ada relasi kepemilikan >1% yang ditemukan untuk ticker ini.")
+
+        with st.expander("📜 Riwayat Bulanan Pemegang >1% (perubahan signifikan)"):
+            detail_df, det_err = fetch_shareholder_detail(ticker)
+            if det_err:
+                st.error(f"❌ Riwayat shareholder gagal diambil: {det_err}")
+            elif detail_df is not None and not detail_df.empty:
+                changes = shareholder_monthly_changes(detail_df)
+                if not changes.empty:
+                    st.dataframe(changes, use_container_width=True, hide_index=True, height=250)
+                else:
+                    st.caption("Tidak ada perubahan kepemilikan signifikan (≥0.1 poin persen) antar-bulan.")
+            else:
+                st.caption("Tidak ada riwayat bulanan untuk ticker ini.")
+
+        with st.expander("🔍 Rekonsiliasi Insider ↔ Broker Pasar Negosiasi (NG)"):
+            st.caption(
+                "Untuk tiap transaksi insider, dicari broker NG di tanggal yang sama "
+                "dengan volume paling mendekati. Kalau tidak ketemu, transaksinya bisa "
+                "di market RG biasa (bukan NG) atau di luar bursa."
+            )
+            if insider_df is not None and not insider_df.empty:
+                recon = reconcile_insider_to_broker(ticker, insider_df)
+                st.dataframe(recon, use_container_width=True, hide_index=True, height=250)
+            else:
+                st.caption("Tidak ada transaksi insider untuk direkonsiliasi.")
+
+        with st.expander("🗓️ Timeline Kepemilikan Gabungan (Lapis A + B)"):
+            events = []
+            if det_err is None and detail_df is not None and not detail_df.empty:
+                changes = shareholder_monthly_changes(detail_df)
+                for _, row in changes.iterrows():
+                    events.append({
+                        "date": row["date"], "lapis": "A — Struktur",
+                        "peristiwa": f"{row['name']}: {row['change']:+.2f}pp → {row['percent']:.2f}%",
+                    })
+            if insider_df is not None and not insider_df.empty:
+                for _, row in insider_df.iterrows():
+                    events.append({
+                        "date": row["date"], "lapis": "B — Insider",
+                        "peristiwa": f"{row.get('name')} {row.get('action')} {row.get('volume'):,.0f} lembar @ {row.get('price')}",
+                    })
+            if events:
+                timeline = pd.DataFrame(events).sort_values("date", ascending=False).reset_index(drop=True)
+                st.dataframe(timeline, use_container_width=True, hide_index=True, height=300)
+            else:
+                st.caption("Tidak ada peristiwa kepemilikan (Lapis A/B) untuk dirangkai jadi timeline.")
+
+        st.subheader("📰 Berita & Diskusi Terkini")
+        st.caption(
+            "InvezGo tidak menyediakan endpoint berita/wire resmi — ini postingan "
+            "komunitas dari platform InvezGo terkait saham ini. Perlakukan sebagai "
+            "sentimen komunitas, BUKAN berita tervalidasi dari media."
+        )
+        posts, posts_err = fetch_stock_posts(ticker)
+        if posts:
+            for p in posts:
+                title = p.get("title") or p.get("content", "")[:80] or "(tanpa judul)"
+                body = p.get("content") or p.get("body") or ""
+                author = p.get("author", {}).get("name") if isinstance(p.get("author"), dict) else p.get("author")
+                created = p.get("created_at") or p.get("date") or p.get("createdAt")
+                with st.container(border=True):
+                    st.markdown(f"**{title}**")
+                    if body and body != title:
+                        st.write(body[:400] + ("..." if len(body) > 400 else ""))
+                    meta = " · ".join(str(x) for x in [author, created] if x)
+                    if meta:
+                        st.caption(meta)
+        elif posts_err:
+            st.error(f"❌ Postingan gagal diambil: {posts_err}")
+        else:
+            st.caption("Tidak ada postingan komunitas untuk saham ini.")
+
+    # ======================================================================
+    # TAB FUNDAMENTAL — laporan keuangan & key statistics/valuasi
+    # ======================================================================
+    with tab_fundamental:
+        f1, f2 = st.columns(2)
+        statement_label = f1.selectbox(
+            "Laporan", ["Laba Rugi", "Neraca", "Arus Kas"], key="fund_statement"
+        )
+        statement_code = {"Laba Rugi": "IS", "Neraca": "BS", "Arus Kas": "CF"}[statement_label]
+        period_label = f2.selectbox("Periode", ["Kuartalan", "Tahunan"], key="fund_period")
+        period_code = "Q" if period_label == "Kuartalan" else "FY"
+
+        fin_data, fin_err = fetch_financial_statement(ticker, statement_code, period_code)
+        if fin_err:
+            st.error(f"❌ Laporan keuangan gagal diambil: {fin_err}")
+        elif fin_data:
+            pivot = rows_to_pivot(fin_data)
+            if statement_code == "IS":
+                rev_row = find_metric_row(pivot, ["pendapatan", "penjualan"])
+                profit_row = find_metric_row(pivot, ["laba periode berjalan", "laba bersih", "laba tahun berjalan"])
+                cost_row = find_metric_row(pivot, ["beban pokok", "beban usaha", "harga pokok"])
+                m1, m2, m3 = st.columns(3)
+                latest_col = pivot.columns[0] if len(pivot.columns) else None
+                if rev_row and latest_col:
+                    m1.metric(f"Pendapatan ({latest_col})", f"{pivot.loc[rev_row, latest_col]:,.0f}")
+                if profit_row and latest_col:
+                    m2.metric(f"Laba ({latest_col})", f"{pivot.loc[profit_row, latest_col]:,.0f}")
+                if cost_row and latest_col:
+                    m3.metric(f"Beban ({latest_col})", f"{pivot.loc[cost_row, latest_col]:,.0f}")
+
+                if rev_row and profit_row:
+                    trend_df = pivot.loc[[rev_row, profit_row]].T
+                    trend_df.columns = ["Pendapatan", "Laba"]
+                    trend_df = trend_df.iloc[::-1]  # urut waktu maju untuk chart
+                    fig, ax = plt.subplots(figsize=(11, 4))
+                    ax.plot(trend_df.index, trend_df["Pendapatan"], marker="o", label="Pendapatan")
+                    ax.plot(trend_df.index, trend_df["Laba"], marker="o", label="Laba")
+                    ax.set_title("Tren Pendapatan vs Laba")
+                    ax.legend(fontsize=8)
+                    ax.grid(alpha=0.2)
+                    plt.xticks(rotation=45, ha="right", fontsize=8)
+                    st.pyplot(fig, use_container_width=True)
+
+            st.markdown(f"**Detail {statement_label} ({period_label})**")
+            st.dataframe(pivot, use_container_width=True, height=350)
+        else:
+            st.caption("Laporan keuangan tidak tersedia untuk ticker/periode ini.")
+
+        st.subheader("📈 Key Statistics / Rasio Valuasi")
+        st.caption(
+            "⚠️ Menurut dokumentasi resmi InvezGo, endpoint ini masih dalam proses "
+            "aktualisasi/kalibrasi — angka bisa kurang akurat, verifikasi silang sebelum dipakai."
+        )
+        keystat_data, keystat_err = fetch_keystat(ticker, period_code)
+        if keystat_err:
+            st.error(f"❌ Key statistics gagal diambil: {keystat_err}")
+        elif keystat_data:
+            keystat_pivot = rows_to_pivot(keystat_data)
+            st.dataframe(keystat_pivot, use_container_width=True, height=350)
+        else:
+            st.caption("Key statistics tidak tersedia untuk ticker/periode ini.")
 
     # --- Analisis AI (Groq) ---
     st.subheader("🤖 Analisis AI (Groq)")

@@ -1034,6 +1034,38 @@ def find_metric_row(pivot_df: pd.DataFrame, keywords: list):
     return None
 
 
+def find_metric_row_priority(pivot_df: pd.DataFrame, keyword_groups: list):
+    """
+    Coba tiap grup keyword berurutan, return match pertama dari grup
+    ter-spesifik. Istilah "laba bersih" di laporan keuangan IDX (berbasis
+    taksonomi XBRL) bervariasi antar-emiten -- "laba (rugi) periode
+    berjalan", "laba tahun berjalan", dll -- jadi satu keyword generik
+    "laba" saja gampang salah tangkap ("laba bruto"/"laba usaha").
+    """
+    for group in keyword_groups:
+        match = find_metric_row(pivot_df, group)
+        if match:
+            return match
+    return None
+
+
+def id_number(x, decimals: int = 0) -> str:
+    """
+    Format angka gaya Indonesia: titik pemisah ribuan, koma pemisah desimal
+    (mis. 1.234.567 atau 1.234,56). decimals=0 cocok untuk nilai laporan
+    keuangan (rupiah), decimals>0 untuk rasio (PER, PBV, dll).
+    """
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return "-"
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return str(x)
+    s = f"{x:,.{decimals}f}"
+    s = s.replace(",", "_").replace(".", ",").replace("_", ".")
+    return s
+
+
 def broker_top3_accumulate(summary: pd.DataFrame):
     """
     Filter '3 broker teratas ngumpulin, broker #1 >= 2x broker #2'.
@@ -1940,32 +1972,50 @@ if mode == "Analisis Satu Saham":
             pivot = rows_to_pivot(fin_data)
             if statement_code == "IS":
                 rev_row = find_metric_row(pivot, ["pendapatan", "penjualan"])
-                profit_row = find_metric_row(pivot, ["laba periode berjalan", "laba bersih", "laba tahun berjalan"])
-                cost_row = find_metric_row(pivot, ["beban pokok", "beban usaha", "harga pokok"])
+                cost_row = find_metric_row(pivot, ["beban pokok", "harga pokok"])
+                profit_row = find_metric_row_priority(pivot, [
+                    ["laba (rugi) periode berjalan", "laba periode berjalan"],
+                    ["laba (rugi) tahun berjalan", "laba tahun berjalan"],
+                    ["laba (rugi) bersih", "laba bersih", "laba neto"],
+                    ["laba (rugi) komprehensif"],
+                    ["laba usaha", "laba (rugi) usaha"],
+                    ["jumlah laba", "laba bruto"],
+                ])
                 m1, m2, m3 = st.columns(3)
                 latest_col = pivot.columns[0] if len(pivot.columns) else None
                 if rev_row and latest_col:
-                    m1.metric(f"Pendapatan ({latest_col})", f"{pivot.loc[rev_row, latest_col]:,.0f}")
+                    m1.metric(f"Pendapatan ({latest_col})", id_number(pivot.loc[rev_row, latest_col]))
                 if profit_row and latest_col:
-                    m2.metric(f"Laba ({latest_col})", f"{pivot.loc[profit_row, latest_col]:,.0f}")
+                    m2.metric(f"Laba ({latest_col})", id_number(pivot.loc[profit_row, latest_col]))
+                    st.caption(f"Baris laba yang dipakai: *{profit_row}*")
                 if cost_row and latest_col:
-                    m3.metric(f"Beban ({latest_col})", f"{pivot.loc[cost_row, latest_col]:,.0f}")
+                    m3.metric(f"Beban Pokok ({latest_col})", id_number(pivot.loc[cost_row, latest_col]))
 
-                if rev_row and profit_row:
-                    trend_df = pivot.loc[[rev_row, profit_row]].T
-                    trend_df.columns = ["Pendapatan", "Laba"]
-                    trend_df = trend_df.iloc[::-1]  # urut waktu maju untuk chart
-                    fig, ax = plt.subplots(figsize=(11, 4))
-                    ax.plot(trend_df.index, trend_df["Pendapatan"], marker="o", label="Pendapatan")
-                    ax.plot(trend_df.index, trend_df["Laba"], marker="o", label="Laba")
-                    ax.set_title("Tren Pendapatan vs Laba")
+                chart_rows = [r for r in [rev_row, cost_row, profit_row] if r]
+                if len(chart_rows) >= 2:
+                    trend_df = pivot.loc[chart_rows].T.iloc[::-1]  # urut waktu maju
+                    rename = {rev_row: "Pendapatan", cost_row: "Beban Pokok", profit_row: "Laba"}
+                    trend_df = trend_df.rename(columns=rename)
+                    fig, ax = plt.subplots(figsize=(11, 4.5))
+                    x = range(len(trend_df))
+                    n = len(trend_df.columns)
+                    bar_w = 0.8 / n
+                    colors = {"Pendapatan": "#3498db", "Beban Pokok": "#e74c3c", "Laba": "#2ecc71"}
+                    for i, col in enumerate(trend_df.columns):
+                        offset = (i - (n - 1) / 2) * bar_w
+                        ax.bar([xi + offset for xi in x], trend_df[col], width=bar_w,
+                               label=col, color=colors.get(col, None))
+                    ax.set_xticks(list(x))
+                    ax.set_xticklabels(trend_df.index, rotation=45, ha="right", fontsize=8)
+                    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: id_number(v)))
+                    ax.set_title(f"Pendapatan vs Beban Pokok vs Laba per Periode ({statement_label})")
                     ax.legend(fontsize=8)
-                    ax.grid(alpha=0.2)
-                    plt.xticks(rotation=45, ha="right", fontsize=8)
+                    ax.grid(alpha=0.2, axis="y")
+                    fig.tight_layout()
                     st.pyplot(fig, use_container_width=True)
 
             st.markdown(f"**Detail {statement_label} ({period_label})**")
-            st.dataframe(pivot, use_container_width=True, height=350)
+            st.dataframe(pivot.applymap(id_number), use_container_width=True, height=350)
         else:
             st.caption("Laporan keuangan tidak tersedia untuk ticker/periode ini.")
 
@@ -1979,7 +2029,7 @@ if mode == "Analisis Satu Saham":
             st.error(f"❌ Key statistics gagal diambil: {keystat_err}")
         elif keystat_data:
             keystat_pivot = rows_to_pivot(keystat_data)
-            st.dataframe(keystat_pivot, use_container_width=True, height=350)
+            st.dataframe(keystat_pivot.applymap(lambda v: id_number(v, 4)), use_container_width=True, height=350)
         else:
             st.caption("Key statistics tidak tersedia untuk ticker/periode ini.")
 

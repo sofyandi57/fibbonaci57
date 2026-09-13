@@ -508,6 +508,54 @@ def broker_top3_accumulate(summary: pd.DataFrame):
     }
 
 
+def top_accumulator_trend(code: str):
+    """
+    Identifikasi broker yang net beli terbesar dalam 30 hari, lalu cek
+    apakah dia MASIH aktif belanja di 10 hari terakhir (bukan cuma net
+    kumulatif lama yang sudah berhenti) -- konsep "diparkir"/"dijaga" ala
+    bandarmologi: broker yang terus menambah net beli = masih mengumpulkan,
+    broker yang net-nya besar tapi diam/berbalik di window terbaru =
+    akumulasi sudah berhenti atau mulai dilepas.
+    """
+    sum30 = fetch_broker_summary(code, 30)
+    sum10 = fetch_broker_summary(code, 10)
+    if sum30 is None or sum30.empty:
+        return None
+
+    df30 = sum30.copy()
+    df30["net"] = df30["buy_volume"] - df30["sell_volume"]
+    top = df30.sort_values("net", ascending=False).iloc[0]
+    broker, net30 = str(top["code"]), float(top["net"])
+    if net30 <= 0:
+        return None  # tidak ada broker yang net akumulasi di 30 hari
+
+    net10 = 0.0
+    if sum10 is not None and not sum10.empty:
+        df10 = sum10.copy()
+        df10["net"] = df10["buy_volume"] - df10["sell_volume"]
+        match = df10[df10["code"] == broker]
+        if not match.empty:
+            net10 = float(match["net"].iloc[0])
+
+    # Proporsi net 10 hari terakhir terhadap net 30 hari -- kalau broker
+    # yang sama masih menyumbang porsi besar di window terbaru, dia masih
+    # aktif; kalau porsinya kecil/negatif, akumulasi sudah melambat/berhenti.
+    share_recent = (net10 / net30) if net30 > 0 else 0.0
+    still_active = net10 > 0 and share_recent >= 0.2
+
+    return {
+        "broker": broker,
+        "net_30d": net30,
+        "net_10d": net10,
+        "share_recent": share_recent,
+        "still_active": still_active,
+        "verdict": (
+            "MASIH AKTIF MENGUMPULKAN" if still_active
+            else "AKUMULASI MELAMBAT / BERHENTI"
+        ),
+    }
+
+
 # --------------------------------------------------------------------------
 # GROQ AI
 # --------------------------------------------------------------------------
@@ -926,6 +974,27 @@ def plot_bandar(df, bdm):
     return fig
 
 
+def plot_volume_30d(df, window: int = 30):
+    """Bar volume N hari terakhir + garis rata-rata, hijau kalau close naik dari hari sebelumnya."""
+    seg = df.tail(window).reset_index(drop=True)
+    avg_vol = float(seg["volume"].mean())
+    colors = [
+        "green" if seg["close"].iloc[i] >= seg["close"].iloc[i - 1] else "red"
+        for i in range(len(seg))
+    ]
+    colors[0] = "gray"
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.bar(seg["date"], seg["volume"], color=colors, alpha=0.75)
+    ax.axhline(avg_vol, color="#333", ls="--", lw=1, label=f"Rata-rata {window}h")
+    ax.set_title(f"Volume {window} Hari Terakhir")
+    ax.set_ylabel("Volume (lembar)")
+    ax.legend(loc="upper left", fontsize=8)
+    ax.grid(alpha=0.2)
+    fig.autofmt_xdate()
+    return fig
+
+
 # --------------------------------------------------------------------------
 # UI
 # --------------------------------------------------------------------------
@@ -1016,6 +1085,23 @@ if mode == "Analisis Satu Saham":
     st.subheader("📊 Chart")
     st.pyplot(plot_chart(df, retr, low_p, high_p), use_container_width=True)
 
+    # --- Volume 30 hari terakhir ---
+    st.subheader("📶 Volume 30 Hari Terakhir")
+    vol_seg = df.tail(30)
+    vol_avg30 = float(vol_seg["volume"].mean())
+    vol_today = float(df["volume"].iloc[-1])
+    avg_recent10 = float(df["volume"].tail(10).mean())
+    avg_prior20 = float(df["volume"].tail(30).head(20).mean()) if len(df) >= 30 else avg_recent10
+    trend = "MENINGKAT" if avg_recent10 > avg_prior20 * 1.1 else (
+        "MENURUN" if avg_recent10 < avg_prior20 * 0.9 else "STABIL"
+    )
+    v1, v2, v3, v4 = st.columns(4)
+    v1.metric("Volume Hari Ini", f"{vol_today:,.0f}")
+    v2.metric("Rata-rata 30 Hari", f"{vol_avg30:,.0f}")
+    v3.metric("Vol Hari Ini vs Rata-rata", f"{vol_today / vol_avg30:.2f}x" if vol_avg30 else "-")
+    v4.metric("Tren 10h Terakhir", trend)
+    st.pyplot(plot_volume_30d(df), use_container_width=True)
+
     # --- Info bandar untuk saham ini ---
     bdm = fetch_bdm(ticker, lookback)
     if bdm is not None and not bdm.empty:
@@ -1042,6 +1128,27 @@ if mode == "Analisis Satu Saham":
                        delta="LOLOS" if binfo["broker_filter_pass"] else "GAGAL")
         else:
             st.caption("Data broker tidak cukup / endpoint butuh paket tertentu.")
+
+    # --- Bandar yang sedang mengumpulkan ---
+    st.subheader("🧲 Bandar yang Sedang Mengumpulkan")
+    trend_info = top_accumulator_trend(ticker)
+    if trend_info:
+        active = trend_info["still_active"]
+        t1, t2, t3 = st.columns(3)
+        t1.metric("Broker Akumulator Terbesar (30h)", trend_info["broker"],
+                   delta=f"net {trend_info['net_30d']:,.0f}")
+        t2.metric("Net 10 Hari Terakhir", f"{trend_info['net_10d']:,.0f}",
+                   delta=f"{trend_info['share_recent']*100:.0f}% dari net 30h")
+        t3.metric("Status", trend_info["verdict"],
+                   delta="AKTIF" if active else "MELAMBAT", delta_color="normal" if active else "inverse")
+        st.caption(
+            "Dihitung dari net beli–jual (bukan net volume kumulatif harian) per broker "
+            "di endpoint summary. 'MASIH AKTIF' berarti broker akumulator terbesar 30 hari "
+            "masih menyumbang porsi besar (≥20%) dari net-nya di 10 hari terakhir — bukan "
+            "cuma sisa net lama yang sudah berhenti dibeli."
+        )
+    else:
+        st.caption("Tidak ada broker dengan net akumulasi positif dalam 30 hari terakhir, atau data broker tidak cukup.")
 
     # --- Analisis AI (Groq) ---
     st.subheader("🤖 Analisis AI (Groq)")

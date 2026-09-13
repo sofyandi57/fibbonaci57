@@ -23,6 +23,21 @@ Data harga diambil dari [InvezGo API](https://invezgo.com).
 | Rencana trading | entry, stop loss, TP1/TP2/TP3, risk-reward |
 | Chart | visualisasi harga vs level fib |
 | **Screener multi-saham** | scan watchlist custom / seluruh IDX, tabel sinyal terfilter, export CSV |
+| **SQLite cache** | data OHLCV **& BDM** disimpan lokal (incremental fetch) — kuota API jauh lebih hemat |
+| **Analisis AI (Groq)** | komentar teknikal berbahasa Indonesia untuk hasil analisis & screener |
+| **Screener Bandar** | deteksi **akumulasi / distribusi bandar saat sideways** — termasuk fase *dini* sebelum volume breakout (filter: volume > 1.5x rata-rata 20 hari), pakai indikator BDM invEZGo |
+
+### Cara kerja Screener Bandar
+
+1. **Sideways detector** — range 40 hari sempit (≤15%).
+2. **Dominasi BDM** — proporsi hari BDM > 0 dalam 20 hari terakhir:
+   ≥60% → akumulasi; ≤40% → distribusi.
+3. **Konfirmasi volume** — volume hari ini > 1.5x rata-rata 20 hari:
+   - `DINI` = BDM sudah dominan tapi volume masih tidur (fase stealth —
+     inilah yang kamu cari sebelum volume besar muncul)
+   - `+ BREAKOUT VOLUME` = konfirmasi breakout sudah terjadi
+4. Dua tombol filter: 🔵 Akumulasi / 🔴 Distribusi (scan sekali, filter tanpa
+   panggil API lagi).
 
 ### Catatan tentang screener
 
@@ -38,7 +53,8 @@ Secrets saat runtime:
 
 - **Streamlit Cloud**: `Settings → Secrets` → tambahkan:
   ```toml
-  INVEZGO_API_KEY = "api_key_anda"
+  INVEZGO_API_KEY = "api_key_invezgo_anda"
+  GROQ_API_KEY   = "api_key_groq_anda"   # gratis: https://console.groq.com/keys
   ```
 - **Lokal**: salin `.streamlit/secrets.toml.example` menjadi
   `.streamlit/secrets.toml` (file ini di-*ignore* git) dan isi key-nya.

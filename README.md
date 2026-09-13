@@ -22,6 +22,14 @@ Data harga diambil dari [InvezGo API](https://invezgo.com).
 | Sinyal pullback | deteksi **weak pullback** & **strong pullback** |
 | Rencana trading | entry, stop loss, TP1/TP2/TP3, risk-reward |
 | Chart | visualisasi harga vs level fib |
+| **Screener multi-saham** | scan watchlist custom / seluruh IDX, tabel sinyal terfilter, export CSV |
+
+### Catatan tentang screener
+
+Screener berjalan **client-side** di dalam app (bukan endpoint
+`/screener/screen` invEZGo), karena perhitungan Fibonacci memerlukan OHLCV
+historis per saham, sedangkan endpoint screener bawaan hanya mendukung formula
+sederhana (`prev < close`, dst) dengan rate limit 1 request/menit.
 
 ## 🔐 Keamanan API Key
 

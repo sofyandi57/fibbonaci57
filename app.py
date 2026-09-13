@@ -2067,6 +2067,28 @@ def analyze_signal(df, low_p, high_p, max_risk_pct, entry_tol=0.01):
             ),
         }, retr, ext
 
+    # Kasus khusus: harga sudah BREAKOUT di atas swing high anchor (ATH/blue
+    # sky) tanpa sempat pullback -- strategi ini murni untuk pullback DI
+    # DALAM range swing low-high, jadi "TIDAK ADA SETUP" di sini valid,
+    # bukan bug, tapi generik "level terdekat" bisa membingungkan (jaraknya
+    # kelihatan wajar padahal sebenarnya harga sudah lama meninggalkan
+    # range). Kasih keterangan spesifik supaya jelas kenapa.
+    if close > high_p:
+        breakout_pct = (close - high_p) / high_p * 100
+        return {
+            "signal": "TIDAK ADA SETUP",
+            "fib_level": "-",
+            "entry": None, "stop_loss": None, "risk_pct": 0,
+            "tp1": None, "tp2": None, "tp3": None,
+            "keterangan": (
+                f"Harga sudah BREAKOUT {breakout_pct:.1f}% di atas swing high anchor "
+                f"({high_p:,.0f}) tanpa pullback -- strategi ini mendeteksi retracement "
+                "DI DALAM range swing low-high, bukan kelanjutan breakout. Tunggu "
+                "swing high baru terbentuk (perlu candle reversal) atau pullback "
+                "pertama sebelum sinyal ini relevan lagi."
+            ),
+        }, retr, ext
+
     nearest_lvl = min(SEQ, key=lambda lvl: abs(close - retr[lvl]))
     dist_pct = (close - retr[nearest_lvl]) / retr[nearest_lvl] * 100
     return {

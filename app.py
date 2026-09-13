@@ -1228,33 +1228,56 @@ def analyze_signal(df, low_p, high_p, max_risk_pct, entry_tol=0.01):
             }, retr, ext
 
     # ---- STRONG PULLBACK: tembus 1 level fib -> tunggu level bawahnya ----
+    # PENTING: pakai level PALING DALAM yang tertembus (bukan yang pertama
+    # ditemukan). SEQ terurut naik persentase = turun harga; kalau harga
+    # jatuh menembus beberapa level sekaligus (mis. break 61.8% DAN 78.6%
+    # di hari yang sama), berhenti di level pertama (61.8%) salah: level
+    # "bawahnya" (nxt) yang dihitung dari situ (78.6%) bisa jadi MASIH DI
+    # ATAS harga close saat ini -- artinya entry > TP1, dead-on-arrival
+    # loss kalau langsung dieksekusi. Level 78.6% (lebih dalam) baru
+    # menghasilkan nxt = swing low, yang selalu <= close.
+    broken_idx = None
     for i, lvl in enumerate(SEQ):
-        level_price = retr[lvl]
-        if prev_close > level_price and close < level_price:
-            nxt = retr[SEQ[i + 1]] if i + 1 < len(SEQ) else low_p
-            risk_pct = (close - nxt * 0.99) / close * 100
-            if abs(risk_pct) <= max_risk_pct:
-                return {
-                    "signal": "STRONG PULLBACK",
-                    "fib_level": f"{lvl*100:.1f}% BREAK",
-                    "entry": nxt,
-                    "stop_loss": nxt * (1 - max_risk_pct / 100),
-                    "risk_pct": abs(risk_pct),
-                    "tp1": close,
-                    "tp2": retr[lvl],
-                    "tp3": ext[1.272],
-                    "keterangan": f"Harga menembus level fib {lvl*100:.1f}%, tunggu di level bawahnya.",
-                }, retr, ext
+        if prev_close > retr[lvl] and close < retr[lvl]:
+            broken_idx = i  # overwrite terus -> tersisa index terdalam
+
+    if broken_idx is not None:
+        lvl = SEQ[broken_idx]
+        nxt = retr[SEQ[broken_idx + 1]] if broken_idx + 1 < len(SEQ) else low_p
+        if nxt >= close:
+            # Jaga-jaga: seharusnya tidak mungkin lagi setelah fix di atas,
+            # tapi kalau tetap terjadi (data swing tidak wajar), jangan
+            # kasih setup entry>TP yang pasti rugi -- treat sebagai skip.
             return {
-                "signal": "SKIP (risiko kebesar)",
+                "signal": "SKIP (level tidak konsisten)",
                 "fib_level": f"{lvl*100:.1f}% BREAK",
-                "entry": None, "stop_loss": None, "risk_pct": abs(risk_pct),
+                "entry": None, "stop_loss": None, "risk_pct": 0,
                 "tp1": None, "tp2": None, "tp3": None,
-                "keterangan": (
-                    f"Menembus level fib {lvl*100:.1f}%, tapi risiko ke level "
-                    f"berikutnya {abs(risk_pct):.1f}% > batas {max_risk_pct}% yang kamu tetapkan."
-                ),
+                "keterangan": "Level fib berikutnya tidak berada di bawah harga saat ini — setup dilewati.",
             }, retr, ext
+        risk_pct = (close - nxt * 0.99) / close * 100
+        if abs(risk_pct) <= max_risk_pct:
+            return {
+                "signal": "STRONG PULLBACK",
+                "fib_level": f"{lvl*100:.1f}% BREAK",
+                "entry": nxt,
+                "stop_loss": nxt * (1 - max_risk_pct / 100),
+                "risk_pct": abs(risk_pct),
+                "tp1": close,
+                "tp2": retr[lvl],
+                "tp3": ext[1.272],
+                "keterangan": f"Harga menembus level fib {lvl*100:.1f}%, tunggu di level bawahnya.",
+            }, retr, ext
+        return {
+            "signal": "SKIP (risiko kebesar)",
+            "fib_level": f"{lvl*100:.1f}% BREAK",
+            "entry": None, "stop_loss": None, "risk_pct": abs(risk_pct),
+            "tp1": None, "tp2": None, "tp3": None,
+            "keterangan": (
+                f"Menembus level fib {lvl*100:.1f}%, tapi risiko ke level "
+                f"berikutnya {abs(risk_pct):.1f}% > batas {max_risk_pct}% yang kamu tetapkan."
+            ),
+        }, retr, ext
 
     nearest_lvl = min(SEQ, key=lambda lvl: abs(close - retr[lvl]))
     dist_pct = (close - retr[nearest_lvl]) / retr[nearest_lvl] * 100

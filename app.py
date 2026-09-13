@@ -854,9 +854,14 @@ with st.sidebar:
 # ==========================================================================
 if mode == "Analisis Satu Saham":
     ticker = st.text_input("Kode Saham (IDX)", value="BBCA").upper().strip()
-    if not st.button("🔍 Analisis", type="primary"):
+    if st.button("🔍 Analisis", type="primary"):
+        st.session_state["single_ticker"] = ticker
+
+    if "single_ticker" not in st.session_state:
         st.info("Masukkan kode saham lalu klik **Analisis**.")
         st.stop()
+
+    ticker = st.session_state["single_ticker"]
 
     df = fetch_daily_chart(ticker, lookback)
     if df is None or len(df) < 30:
@@ -986,27 +991,30 @@ elif mode == "Screener Multi-Saham":
 
     tickers = tickers[:max_stocks]
 
-    if not st.button("▶️ Jalankan Screener", type="primary"):
+    if st.button("▶️ Jalankan Screener", type="primary"):
+        rows, errors = [], 0
+        prog = st.progress(0, text="Memulai scan…")
+        for i, code in enumerate(tickers):
+            prog.progress(
+                (i + 1) / len(tickers), text=f"Scan {code} ({i+1}/{len(tickers)})…"
+            )
+            try:
+                row, _, _ = full_analysis(code, lookback, max_risk)
+                if row:
+                    rows.append(row)
+            except Exception:
+                errors += 1
+            time.sleep(0.05)
+        prog.empty()
+        st.session_state["fib_rows"] = rows
+        st.session_state["fib_errors"] = errors
+
+    if "fib_rows" not in st.session_state or not st.session_state["fib_rows"]:
+        st.info("Klik **▶️ Jalankan Screener** untuk memulai.")
         st.stop()
 
-    rows, errors = [], 0
-    prog = st.progress(0, text="Memulai scan…")
-    for i, code in enumerate(tickers):
-        prog.progress(
-            (i + 1) / len(tickers), text=f"Scan {code} ({i+1}/{len(tickers)})…"
-        )
-        try:
-            row, _, _ = full_analysis(code, lookback, max_risk)
-            if row:
-                rows.append(row)
-        except Exception:
-            errors += 1
-        time.sleep(0.05)
-    prog.empty()
-
-    if not rows:
-        st.warning("Tidak ada data yang berhasil diambil.")
-        st.stop()
+    rows = st.session_state["fib_rows"]
+    errors = st.session_state.get("fib_errors", 0)
 
     res = pd.DataFrame(rows)
     res = res.sort_values(

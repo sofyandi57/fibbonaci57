@@ -39,6 +39,18 @@ Data harga diambil dari [InvezGo API](https://invezgo.com).
 4. Dua tombol filter: 🔵 Akumulasi / 🔴 Distribusi (scan sekali, filter tanpa
    panggil API lagi).
 
+### Filter kedua: konsentrasi broker (opsional)
+
+Menggunakan endpoint `/analysis/summary/stock/{code}` — agregat net volume
+(buy − sell) per broker selama 10/20/60 hari:
+
+- **Lolos** jika 3 broker teratas *semuanya* net positif (ngumpulin) **dan**
+  net broker #1 ≥ **2x** net broker #2 (tanda akumulasi terkonsentrasi,
+  bukan sebaran rata).
+- Hasil agregat di-cache di tabel `kv_cache` — scan ulang tidak memakai kuota.
+- Di mode single stock, top-3 broker + rasio #1:#2 ditampilkan di panel
+  "🏦 Top 3 Broker".
+
 ### Catatan tentang screener
 
 Screener berjalan **client-side** di dalam app (bukan endpoint
@@ -84,6 +96,12 @@ jika secrets Supabase ada → dipakai; jika tidak → fallback SQLite lokal.
      date  DATE NOT NULL,
      value REAL,
      PRIMARY KEY (code, date)
+   );
+
+   CREATE TABLE kv_cache (
+     key        TEXT PRIMARY KEY,
+     payload    TEXT,
+     fetched_at TEXT
    );
    ```
 3. Ambil kredensial di **Settings → API**:

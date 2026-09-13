@@ -155,6 +155,13 @@ def db_init():
                    PRIMARY KEY (code, date)
                )"""
         )
+        con.execute(
+            """CREATE TABLE IF NOT EXISTS kv_cache (
+                   key        TEXT PRIMARY KEY,
+                   payload    TEXT,
+                   fetched_at TEXT
+               )"""
+        )
 
 
 db_init()
@@ -194,6 +201,39 @@ def db_insert_candles(code: str, df: pd.DataFrame):
             "INSERT OR REPLACE INTO candles "
             "(code, date, open, high, low, close, volume) VALUES (?,?,?,?,?,?,?)",
             rows,
+        )
+
+
+# ---------- dispatcher: kv (payload JSON, utk agregat spt broker summary) ----------
+def db_get_kv(key: str):
+    """Return (payload_str, fetched_at_str) atau (None, None)."""
+    if _use_supabase():
+        url = f"{st.secrets['SUPABASE_URL']}/rest/v1/kv_cache"
+        r = requests.get(
+            url, headers=_sb_headers(),
+            params={"key": f"eq.{key}", "limit": "1"}, timeout=30,
+        )
+        if r.status_code != 200 or not r.json():
+            return None, None
+        row = r.json()[0]
+        return row["payload"], row["fetched_at"]
+    with db_conn() as con:
+        cur = con.execute(
+            "SELECT payload, fetched_at FROM kv_cache WHERE key = ?", (key,)
+        )
+        row = cur.fetchone()
+    return (row[0], row[1]) if row else (None, None)
+
+
+def db_set_kv(key: str, payload: str, fetched_at: str):
+    if _use_supabase():
+        _sb_upsert("kv_cache",
+                   [{"key": key, "payload": payload, "fetched_at": fetched_at}])
+        return
+    with db_conn() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO kv_cache (key, payload, fetched_at) "
+            "VALUES (?,?,?)", (key, payload, fetched_at),
         )
 
 
@@ -356,6 +396,90 @@ def fetch_stock_list():
     if r.status_code != 200:
         return []
     return [s["code"] for s in r.json()]
+
+
+# --------------------------------------------------------------------------
+# BROKER SUMMARY (top-3 akumulasi: broker #1 >= 2x broker #2)
+# --------------------------------------------------------------------------
+from datetime import datetime as _dt
+from datetime import time as _dtime
+
+
+def _wib_now() -> _dt:
+    return _dt.utcnow() + timedelta(hours=7)
+
+
+def _eod_fresh(fetched_at: str) -> bool:
+    """Data broker EOD jam 18:00 WIB — segar jika diambil setelah cutoff."""
+    try:
+        ts = _dt.fromisoformat(fetched_at)
+    except (ValueError, TypeError):
+        return False
+    now = _wib_now()
+    cutoff = _dt.combine(now.date(), _dtime(18, 5))
+    if now < cutoff:
+        cutoff -= timedelta(days=1)
+    return ts >= cutoff
+
+
+def fetch_broker_summary(code: str, window: int):
+    """
+    Agregat buy/sell per broker untuk rentang [today-window, today].
+    Endpoint: GET /analysis/summary/stock/{code} (EOD 18:00 WIB).
+    Di-cache di kv_cache — scan ulang tidak memakai kuota API.
+    """
+    frm = (date.today() - timedelta(days=window)).isoformat()
+    to = date.today().isoformat()
+    key = f"{code}|brokersum|{window}|{frm}"
+
+    payload, fetched_at = db_get_kv(key)
+    if payload and fetched_at and _eod_fresh(fetched_at):
+        return pd.read_json(payload)
+
+    api_key = get_secret("INVEZGO_API_KEY")
+    try:
+        r = requests.get(
+            f"{BASE_URL}/analysis/summary/stock/{code}",
+            params={"from": frm, "to": to, "investor": "all", "market": "RG"},
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=60,
+        )
+    except requests.RequestException:
+        return pd.read_json(payload) if payload else None
+    if r.status_code in (204, 401, 402, 429, 404):
+        return pd.read_json(payload) if payload else None
+    r.raise_for_status()
+    data = r.json()
+    if not data:
+        return None
+    df = pd.DataFrame(data)
+    for col in ["buy_volume", "sell_volume", "net_volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    db_set_kv(key, df.to_json(), _wib_now().isoformat())
+    return df
+
+
+def broker_top3_accumulate(summary: pd.DataFrame):
+    """
+    Filter '3 broker teratas ngumpulin, broker #1 >= 2x broker #2'.
+    Return dict info atau None jika data tidak cukup.
+    """
+    if summary is None or summary.empty:
+        return None
+    df = summary.copy()
+    df["net"] = df["buy_volume"] - df["sell_volume"]
+    top = df.sort_values("net", ascending=False).head(3)
+    if len(top) < 3:
+        return None
+    n1, n2, n3 = (float(top["net"].iloc[i]) for i in range(3))
+    b1, b2, b3 = (str(top["code"].iloc[i]) for i in range(3))
+    passed = (n1 > 0 and n2 > 0 and n3 > 0) and (n1 >= 2 * n2)
+    return {
+        "b1": b1, "b2": b2, "b3": b3,
+        "net1": n1, "net2": n2, "net3": n3,
+        "ratio_1v2": (n1 / n2) if n2 > 0 else float("inf"),
+        "broker_filter_pass": passed,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -759,6 +883,20 @@ if mode == "Analisis Satu Saham":
             b4.metric("Lebar Range 40h", f"{info['range_pct']:.1f}%")
         st.pyplot(plot_bandar(df, bdm), use_container_width=True)
 
+    # --- Top-3 broker akumulasi ---
+    with st.expander("🏦 Top 3 Broker (net akumulasi 20 hari)"):
+        bsum = fetch_broker_summary(ticker, 20)
+        binfo = broker_top3_accumulate(bsum)
+        if binfo:
+            bb1, bb2, bb3, bb4 = st.columns(4)
+            bb1.metric(f"#1 {binfo['b1']}", f"{binfo['net1']:,.0f}")
+            bb2.metric(f"#2 {binfo['b2']}", f"{binfo['net2']:,.0f}")
+            bb3.metric(f"#3 {binfo['b3']}", f"{binfo['net3']:,.0f}")
+            bb4.metric("Rasio #1:#2", f"{binfo['ratio_1v2']:.2f}x",
+                       delta="LOLOS" if binfo["broker_filter_pass"] else "GAGAL")
+        else:
+            st.caption("Data broker tidak cukup / endpoint butuh paket tertentu.")
+
     # --- Analisis AI (Groq) ---
     st.subheader("🤖 Analisis AI (Groq)")
     if st.button("✨ Minta Analisis AI", use_container_width=True):
@@ -917,6 +1055,14 @@ else:
 
     tickers = tickers[:max_stocks]
 
+    # --- filter kedua: konsentrasi broker ---
+    st.markdown("**Filter kedua (opsional): konsentrasi broker**")
+    use_broker_filter = st.checkbox(
+        "3 broker teratas sedang ngumpulin & broker #1 ≥ 2x broker #2",
+        value=False,
+    )
+    broker_window = st.selectbox("Rentang agregasi broker", [10, 20, 60], index=1)
+
     run_col, note_col = st.columns([1, 3])
     run_scan = run_col.button("▶️ Scan Bandar", type="primary")
     note_col.caption("Sekali scan — hasil disimpan di session; tombol biru/merah di bawah hanya memfilter (hemat kuota).")
@@ -931,6 +1077,11 @@ else:
             try:
                 row = bandar_analysis(code, lookback)
                 if row:
+                    if use_broker_filter:
+                        binfo = broker_top3_accumulate(
+                            fetch_broker_summary(code, broker_window)
+                        )
+                        row.update(binfo or {})
                     rows.append(row)
             except Exception:
                 errors += 1
@@ -979,14 +1130,23 @@ else:
         view = view[view["kind"] == active]
     if only_side:
         view = view[view["sideways"]]
+    if use_broker_filter and "broker_filter_pass" in view.columns:
+        view = view[view["broker_filter_pass"] == True]  # noqa: E712
 
     cols = ["code", "price", "stage", "range_pct", "acc_pct", "net_bdm",
             "vol_ratio", "sideways"]
+    if use_broker_filter and "b1" in view.columns:
+        cols += ["b1", "b2", "b3", "ratio_1v2"]
     view = view.sort_values(
         ["vol_breakout", "acc_pct" if active == "DISTRIBUSI" else "acc_pct"],
         ascending=[False, active == "DISTRIBUSI"],
     )
     st.dataframe(view[cols], use_container_width=True, hide_index=True)
+    if use_broker_filter and view.empty:
+        st.warning(
+            "Tidak ada yang lolos kombinasi filter — coba longgarkan "
+            "(matikan 'hanya sideways' atau perpendek rentang broker)."
+        )
 
     st.download_button(
         "⬇️ Download hasil (CSV)",

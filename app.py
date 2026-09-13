@@ -1653,7 +1653,14 @@ def _groq_call(key: str, model: str, prompt: str):
                     "Kamu adalah analis teknikal saham IDX berpengalaman. "
                     "Jawab dalam Bahasa Indonesia, ringkas namun substantif "
                     "(maks ~400 kata). Selalu tutup dengan pengingat bahwa "
-                    "analisis bersifat edukasi, bukan rekomendasi beli/jual."
+                    "analisis bersifat edukasi, bukan rekomendasi beli/jual. "
+                    "PENTING: jangan pernah menebak atau mengarang nama panjang "
+                    "perusahaan, sektor, atau bidang usaha dari kode ticker "
+                    "berdasarkan ingatanmu sendiri -- banyak kode ticker mirip "
+                    "dengan singkatan nama sektor lain padahal bidang usahanya "
+                    "beda total. Gunakan HANYA data profil perusahaan yang "
+                    "eksplisit diberikan di prompt user; kalau tidak diberikan, "
+                    "sebut kode tickernya saja tanpa menambah nama/sektor."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -1747,16 +1754,50 @@ def groq_chat(prompt: str) -> str:
     )
 
 
+def company_profile_line(code: str) -> str:
+    """
+    Satu baris profil perusahaan asli (nama, sektor, industri, aktivitas)
+    untuk disisipkan ke prompt Groq -- supaya model TIDAK menebak/mengarang
+    profil dari "ingatannya" sendiri terhadap kode ticker (contoh nyata:
+    SSIA/Surya Semesta Internusa -- konstruksi & properti -- pernah
+    dihalusinasikan sebagai "Sarana Sawit Indonesia"/kelapa sawit).
+    Return string kosong kalau info gagal diambil (bukan error fatal).
+    """
+    try:
+        info, _ = fetch_company_info(code)
+    except Exception:
+        info = None
+    if not info:
+        return f"{code}: (profil perusahaan tidak tersedia)"
+    return (
+        f"{code}: {info.get('name', '-')} — sektor {info.get('sector', '-')}, "
+        f"subsektor {info.get('subsector', '-')}, industri {info.get('industry', '-')}, "
+        f"aktivitas: {info.get('activity', '-')}"
+    )
+
+
+ANTI_HALLUCINATION_NOTE = (
+    "\n\nPENTING: gunakan HANYA data profil perusahaan yang diberikan di atas "
+    "untuk menyebut nama, sektor, atau bidang usaha emiten. JANGAN menebak "
+    "atau mengarang nama panjang/sektor dari kode ticker berdasarkan "
+    "ingatanmu sendiri -- kalau profil untuk suatu kode tidak diberikan atau "
+    "tidak tersedia, sebut kode tickernya saja tanpa menambahkan nama/sektor."
+)
+
+
 def build_analysis_prompt(code, structure, sig, retr, ext, recent_closes):
     closes_str = ", ".join(f"{c:,.0f}" for c in recent_closes)
     fib_str = ", ".join(f"{l*100:.1f}%={retr[l]:,.0f}" for l in FIB_LEVELS)
+    profile = company_profile_line(code)
     return f"""Analisis teknikal singkat saham {code} (IDX):
 
+PROFIL PERUSAHAAN: {profile}
 MARKET STRUCTURE: {structure}
 LEVEL FIBONACCI (swing low->high): {fib_str}
 SINYAL: {sig['signal']} (level {sig['fib_level']})
 RENCANA: entry={sig['entry']}, SL={sig['stop_loss']}, TP1={sig['tp1']}, TP2={sig['tp2']}, TP3={sig['tp3']}, risiko={sig['risk_pct']:.2f}%
 10 CLOSE TERAKHIR: {closes_str}
+{ANTI_HALLUCINATION_NOTE}
 
 Tugas:
 1. Evaluasi kualitas setup ini (apakah weak/strong pullback masuk akal?).
@@ -3112,9 +3153,12 @@ elif mode == "Screener Multi-Saham":
             st.warning("Hasil tersaring kosong — longgarkan filter.")
         else:
             summary = view.dropna(axis=1, how="all").to_string(index=False)
+            profiles = "\n".join(company_profile_line(c) for c in view["code"].unique())
             prompt = (
                 "Berikut hasil screener Fibonacci pullback untuk saham IDX:\n\n"
-                f"{summary}\n\n"
+                f"PROFIL PERUSAHAAN:\n{profiles}\n\n"
+                f"DATA SCREENER:\n{summary}\n"
+                f"{ANTI_HALLUCINATION_NOTE}\n\n"
                 "Buat ringkasan dalam Bahasa Indonesia: saham mana yang paling "
                 "menarik dan mengapa, apa risiko umumnya, dan saran "
                 "tindak lanjut (bukan rekomendasi beli/jual)."
@@ -3397,9 +3441,12 @@ elif mode == "Screener Bandar":
                     st.warning("Hasil tersaring kosong — longgarkan filter.")
                 else:
                     summary = view[cols].to_string(index=False)
+                    profiles = "\n".join(company_profile_line(c) for c in view["code"].unique())
                     prompt = (
                         "Berikut hasil screener bandarmologi (BDM) untuk saham IDX:\n\n"
-                        f"{summary}\n\n"
+                        f"PROFIL PERUSAHAAN:\n{profiles}\n\n"
+                        f"DATA SCREENER:\n{summary}\n"
+                        f"{ANTI_HALLUCINATION_NOTE}\n\n"
                         "Buat ringkasan Bahasa Indonesia: mana yang akumulasi paling "
                         "kuat, mana yang waspada distribusi, arti fase 'DINI' vs "
                         "'BREAKOUT VOLUME', dan hal yang perlu dikonfirmasi sebelum "

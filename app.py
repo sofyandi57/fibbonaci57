@@ -570,7 +570,10 @@ def fetch_insider_transactions(code: str, months: int = INSIDER_LOOKBACK_MONTHS)
         try:
             age_hours = (_wib_now() - _dt.fromisoformat(fetched_at)).total_seconds() / 3600
             if age_hours < SHAREHOLDER_CACHE_TTL_HOURS:
-                return pd.read_json(io.StringIO(payload)), None
+                cached_df = pd.read_json(io.StringIO(payload))
+                if "date" in cached_df.columns:
+                    cached_df["date"] = pd.to_datetime(cached_df["date"]).dt.date
+                return cached_df, None
         except (ValueError, TypeError):
             pass
 
@@ -646,8 +649,14 @@ def insider_verdict(insider_df: pd.DataFrame, days: int = 90):
     """Ringkasan: dalam `days` hari terakhir, insider net beli atau net jual?"""
     if insider_df is None or insider_df.empty or "date" not in insider_df.columns:
         return None
-    cutoff = date.today() - timedelta(days=days)
-    recent = insider_df[insider_df["date"] >= cutoff].copy()
+    # Kolom "date" bisa berupa python `date` (jalur fresh-fetch, sudah
+    # di-.dt.date) ATAU Timestamp/datetime64 (jalur cache, hasil
+    # pd.read_json otomatis parse tanggal) -- membandingkan dtype campuran
+    # ini langsung raises TypeError di pandas versi baru. Normalisasi ke
+    # Timestamp dulu di kedua sisi supaya perbandingan selalu valid.
+    dates = pd.to_datetime(insider_df["date"])
+    cutoff = pd.Timestamp(date.today() - timedelta(days=days))
+    recent = insider_df[dates >= cutoff].copy()
     if recent.empty:
         return {"net_transactions": 0, "verdict": "TIDAK ADA TRANSAKSI", "count": 0}
 
@@ -684,7 +693,10 @@ def fetch_shareholder_detail(code: str):
         try:
             age_hours = (_wib_now() - _dt.fromisoformat(fetched_at)).total_seconds() / 3600
             if age_hours < SHAREHOLDER_CACHE_TTL_HOURS:
-                return pd.read_json(io.StringIO(payload)), None
+                cached_df = pd.read_json(io.StringIO(payload))
+                if "date" in cached_df.columns:
+                    cached_df["date"] = pd.to_datetime(cached_df["date"]).dt.date
+                return cached_df, None
         except (ValueError, TypeError):
             pass
 

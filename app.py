@@ -502,8 +502,12 @@ def fetch_bdm(code: str, days: int):
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_stock_list():
-    """Daftar seluruh kode saham IDX dari /analysis/list/stock."""
+def fetch_stock_list_full():
+    """
+    Daftar LENGKAP seluruh saham IDX (code, name, sector, logo) dari
+    /analysis/list/stock -- SATU panggilan API untuk semua ~900 saham
+    sekaligus, tidak perlu loop fetch_company_info() per saham.
+    """
     api_key = get_secret("INVEZGO_API_KEY")
     try:
         r = requests.get(
@@ -515,7 +519,46 @@ def fetch_stock_list():
         return []
     if r.status_code != 200:
         return []
-    return [s["code"] for s in r.json()]
+    return r.json()
+
+
+def fetch_stock_list():
+    """Daftar seluruh kode saham IDX (kompatibel dengan pemanggil lama)."""
+    return [s["code"] for s in fetch_stock_list_full()]
+
+
+# Klasifikasi 11 sektor IDX-IC resmi BEI (nama Indonesia -> kode indeks
+# sektoral) -- ini standar publik dari Bursa Efek Indonesia, bukan
+# tebakan/hafalan model. Dipakai untuk memetakan field "sector" (nama
+# Indonesia) yang dikembalikan /analysis/list/stock ke kode seperti
+# IDXBASIC/IDXNONCYC yang dipakai endpoint sector/rotation & stalker/sector.
+IDXIC_SECTOR_MAP = {
+    "Energi": "IDXENERGY",
+    "Barang Baku": "IDXBASIC",
+    "Perindustrian": "IDXINDUST",
+    "Barang Konsumen Primer": "IDXNONCYC",
+    "Barang Konsumen Non-Primer": "IDXCYCLIC",
+    "Kesehatan": "IDXHEALTH",
+    "Keuangan": "IDXFINANCE",
+    "Properti & Real Estat": "IDXPROPERT",
+    "Teknologi": "IDXTECHNO",
+    "Infrastruktur": "IDXINFRA",
+    "Transportasi & Logistik": "IDXTRANS",
+}
+
+
+def sector_members(sector_code: str) -> pd.DataFrame:
+    """
+    Semua saham yang tergolong satu sektor IDX-IC (mis. IDXBASIC,
+    IDXNONCYC), dari SATU panggilan /analysis/list/stock yang sudah
+    di-cache 24 jam -- tidak menambah kuota API tiap kali dipanggil ulang.
+    """
+    sector_name = next((k for k, v in IDXIC_SECTOR_MAP.items() if v == sector_code), None)
+    if sector_name is None:
+        return pd.DataFrame()
+    all_stocks = fetch_stock_list_full()
+    rows = [s for s in all_stocks if s.get("sector") == sector_name]
+    return pd.DataFrame(rows)
 
 
 # --------------------------------------------------------------------------
@@ -3815,6 +3858,24 @@ elif mode == "Outlook Pasar":
         st.error(f"❌ Rotasi sektor gagal diambil: {rotation_err}")
     else:
         st.caption("Data rotasi sektor kosong untuk rentang ini.")
+
+    st.markdown("### 🏷️ Anggota Sektor IDX-IC")
+    st.caption(
+        "Klasifikasi 11 sektor resmi Bursa Efek Indonesia (IDX-IC). Pilih "
+        "sektor untuk lihat semua saham anggotanya."
+    )
+    sec_choice = st.selectbox("Sektor", list(IDXIC_SECTOR_MAP.items()),
+                               format_func=lambda kv: f"{kv[1]} — {kv[0]}")
+    members_df = sector_members(sec_choice[1])
+    if not members_df.empty:
+        st.caption(f"{len(members_df)} saham di sektor {sec_choice[0]} ({sec_choice[1]}).")
+        show_cols = [c for c in ["code", "name", "sector"] if c in members_df.columns]
+        st.dataframe(
+            members_df[show_cols].sort_values("code"),
+            use_container_width=True, hide_index=True, height=350,
+        )
+    else:
+        st.caption("Data anggota sektor tidak tersedia — cek API key / paket langganan.")
 
     st.markdown("### ⚠️ Saham dengan Notasi Khusus (Watchlist)")
     st.caption(

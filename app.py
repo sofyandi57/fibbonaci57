@@ -628,6 +628,7 @@ def analyze_signal(df, low_p, high_p, max_risk_pct, entry_tol=0.01):
                 "tp1": close + risk,          # 1 : 1
                 "tp2": min(ext[1.272], close + 2 * risk),
                 "tp3": ext[1.618],
+                "keterangan": f"Rebound bullish tepat di level fib {lvl*100:.1f}%.",
             }, retr, ext
 
     # ---- STRONG PULLBACK: tembus 1 level fib -> tunggu level bawahnya ----
@@ -646,19 +647,30 @@ def analyze_signal(df, low_p, high_p, max_risk_pct, entry_tol=0.01):
                     "tp1": close,
                     "tp2": retr[lvl],
                     "tp3": ext[1.272],
+                    "keterangan": f"Harga menembus level fib {lvl*100:.1f}%, tunggu di level bawahnya.",
                 }, retr, ext
             return {
                 "signal": "SKIP (risiko kebesar)",
                 "fib_level": f"{lvl*100:.1f}% BREAK",
                 "entry": None, "stop_loss": None, "risk_pct": abs(risk_pct),
                 "tp1": None, "tp2": None, "tp3": None,
+                "keterangan": (
+                    f"Menembus level fib {lvl*100:.1f}%, tapi risiko ke level "
+                    f"berikutnya {abs(risk_pct):.1f}% > batas {max_risk_pct}% yang kamu tetapkan."
+                ),
             }, retr, ext
 
+    nearest_lvl = min(SEQ, key=lambda lvl: abs(close - retr[lvl]))
+    dist_pct = (close - retr[nearest_lvl]) / retr[nearest_lvl] * 100
     return {
         "signal": "TIDAK ADA SETUP",
         "fib_level": "-",
         "entry": None, "stop_loss": None, "risk_pct": 0,
         "tp1": None, "tp2": None, "tp3": None,
+        "keterangan": (
+            f"Harga belum menyentuh/menembus level fib manapun (level terdekat "
+            f"{nearest_lvl*100:.1f}%, jarak {dist_pct:+.1f}%)."
+        ),
     }, retr, ext
 
 
@@ -677,10 +689,19 @@ def full_analysis(code: str, lookback: int, max_risk: float):
     if anchor and structure == "UPTREND":
         sig, _, _ = analyze_signal(df, anchor[0][1], anchor[1][1], max_risk)
         row.update(sig)
+    elif not anchor:
+        row.update({"signal": "-", "fib_level": "-", "entry": None,
+                    "stop_loss": None, "risk_pct": 0,
+                    "tp1": None, "tp2": None, "tp3": None,
+                    "keterangan": "Swing high/low belum cukup — perpanjang lookback."})
     else:
         row.update({"signal": "-", "fib_level": "-", "entry": None,
                     "stop_loss": None, "risk_pct": 0,
-                    "tp1": None, "tp2": None, "tp3": None})
+                    "tp1": None, "tp2": None, "tp3": None,
+                    "keterangan": (
+                        f"Struktur {structure}, bukan UPTREND — pullback fib "
+                        "hanya dicek saat market structure UPTREND."
+                    )})
     return row, df, anchor
 
 
@@ -1004,15 +1025,21 @@ elif mode == "Screener Multi-Saham":
     sig_filter = f1.multiselect(
         "Filter sinyal",
         options=res["signal"].unique().tolist(),
-        default=[s for s in ["WEAK PULLBACK", "STRONG PULLBACK"] if s in res["signal"].unique()],
+        default=res["signal"].unique().tolist(),
     )
     str_filter = f2.multiselect(
         "Filter struktur",
         options=res["structure"].unique().tolist(),
-        default=["UPTREND"],
+        default=res["structure"].unique().tolist(),
     )
     view = res[res["signal"].isin(sig_filter) & res["structure"].isin(str_filter)]
-    st.dataframe(view, use_container_width=True, hide_index=True)
+    if view.empty:
+        st.warning("Tidak ada saham yang cocok dengan filter — longgarkan pilihan di atas.")
+    else:
+        cols_order = ["code", "price", "structure", "signal", "keterangan",
+                      "fib_level", "entry", "stop_loss", "risk_pct", "tp1", "tp2", "tp3"]
+        cols_order = [c for c in cols_order if c in view.columns]
+        st.dataframe(view[cols_order], use_container_width=True, hide_index=True)
 
     dl_col, ai_col = st.columns(2)
     dl_col.download_button(

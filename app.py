@@ -17,6 +17,7 @@ Arsitektur:
 Disclaimer: aplikasi ini untuk EDUKASI, bukan rekomendasi beli/jual.
 """
 
+import io
 import os
 import sqlite3
 import time
@@ -445,7 +446,7 @@ def fetch_broker_summary(code: str, window: int):
 
     payload, fetched_at = db_get_kv(key)
     if payload and fetched_at and _eod_fresh(fetched_at):
-        return pd.read_json(payload)
+        return pd.read_json(io.StringIO(payload))
 
     api_key = get_secret("INVEZGO_API_KEY")
     try:
@@ -456,9 +457,9 @@ def fetch_broker_summary(code: str, window: int):
             timeout=60,
         )
     except requests.RequestException:
-        return pd.read_json(payload) if payload else None
+        return pd.read_json(io.StringIO(payload)) if payload else None
     if r.status_code in (204, 401, 402, 429, 404):
-        return pd.read_json(payload) if payload else None
+        return pd.read_json(io.StringIO(payload)) if payload else None
     r.raise_for_status()
     data = r.json()
     if not data:

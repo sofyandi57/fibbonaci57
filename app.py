@@ -1066,6 +1066,22 @@ def id_number(x, decimals: int = 0) -> str:
     return s
 
 
+def format_df_id(df: pd.DataFrame, decimals: int = 0) -> pd.DataFrame:
+    """
+    Terapkan id_number ke semua sel DataFrame. DataFrame.applymap() dihapus
+    total di pandas versi baru (diganti .map()), tapi .map() elementwise
+    baru ADA sejak pandas 2.1 -- pakai yang tersedia di versi mana pun yang
+    ter-install, alih-alih hardcode salah satunya.
+    """
+    fn = lambda v: id_number(v, decimals)
+    if hasattr(df, "map"):
+        try:
+            return df.map(fn)
+        except TypeError:
+            pass  # DataFrame.map lama (Series-only alias) -- fallback di bawah
+    return df.applymap(fn)
+
+
 def broker_top3_accumulate(summary: pd.DataFrame):
     """
     Filter '3 broker teratas ngumpulin, broker #1 >= 2x broker #2'.
@@ -2015,7 +2031,7 @@ if mode == "Analisis Satu Saham":
                     st.pyplot(fig, use_container_width=True)
 
             st.markdown(f"**Detail {statement_label} ({period_label})**")
-            st.dataframe(pivot.applymap(id_number), use_container_width=True, height=350)
+            st.dataframe(format_df_id(pivot), use_container_width=True, height=350)
         else:
             st.caption("Laporan keuangan tidak tersedia untuk ticker/periode ini.")
 
@@ -2029,7 +2045,7 @@ if mode == "Analisis Satu Saham":
             st.error(f"❌ Key statistics gagal diambil: {keystat_err}")
         elif keystat_data:
             keystat_pivot = rows_to_pivot(keystat_data)
-            st.dataframe(keystat_pivot.applymap(lambda v: id_number(v, 4)), use_container_width=True, height=350)
+            st.dataframe(format_df_id(keystat_pivot, 4), use_container_width=True, height=350)
         else:
             st.caption("Key statistics tidak tersedia untuk ticker/periode ini.")
 

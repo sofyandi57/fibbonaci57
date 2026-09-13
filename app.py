@@ -485,6 +485,125 @@ def fetch_broker_summary(code: str, window: int):
     return df
 
 
+# --------------------------------------------------------------------------
+# KEPEMILIKAN (shareholder & insider) -- versi ringkas dari konsep skill
+# "analisa-kepemilikan": siapa pemegang saham & apakah insider sedang net
+# beli/jual. TIDAK mencoba merekonsiliasi insider ke broker/pasar negosiasi
+# atau menggambar graf relasi -- itu laporan multi-lapis terpisah, di luar
+# scope screener/analyzer harian app ini.
+# --------------------------------------------------------------------------
+SHAREHOLDER_CACHE_TTL_HOURS = 24  # komposisi kepemilikan terbit bulanan, tidak perlu re-fetch tiap hari
+INSIDER_LOOKBACK_MONTHS = 18
+
+
+def fetch_shareholders(code: str):
+    """
+    Komposisi pemegang saham >1% saat ini.
+    Endpoint: GET /analysis/shareholder/stock/{code}.
+    Cache 24 jam di kv_cache -- data ini terbit bulanan, bukan harian.
+    """
+    key = f"{code}|shareholders"
+    payload, fetched_at = db_get_kv(key)
+    if payload and fetched_at:
+        try:
+            age_hours = (_wib_now() - _dt.fromisoformat(fetched_at)).total_seconds() / 3600
+            if age_hours < SHAREHOLDER_CACHE_TTL_HOURS:
+                return pd.read_json(io.StringIO(payload))
+        except (ValueError, TypeError):
+            pass
+
+    api_key = get_secret("INVEZGO_API_KEY")
+    try:
+        r = requests.get(
+            f"{BASE_URL}/analysis/shareholder/stock/{code}",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=30,
+        )
+    except requests.RequestException:
+        return pd.read_json(io.StringIO(payload)) if payload else None
+    if r.status_code in (204, 401, 402, 404, 429):
+        return pd.read_json(io.StringIO(payload)) if payload else None
+    r.raise_for_status()
+    data = r.json()
+    if not data:
+        return None
+    df = pd.DataFrame(data)
+    if "percentage" in df.columns:
+        df["percentage"] = pd.to_numeric(df["percentage"], errors="coerce")
+        df = df.sort_values("percentage", ascending=False).reset_index(drop=True)
+    db_set_kv(key, df.to_json(), _wib_now().isoformat())
+    return df
+
+
+def fetch_insider_transactions(code: str, months: int = INSIDER_LOOKBACK_MONTHS):
+    """
+    Riwayat transaksi insider (wajib lapor >5% / direksi / komisaris).
+    Endpoint: GET /analysis/insider/stock/{code}.
+    """
+    frm = (date.today() - timedelta(days=months * 30)).isoformat()
+    to = date.today().isoformat()
+    key = f"{code}|insider|{months}m"
+
+    payload, fetched_at = db_get_kv(key)
+    if payload and fetched_at:
+        try:
+            age_hours = (_wib_now() - _dt.fromisoformat(fetched_at)).total_seconds() / 3600
+            if age_hours < SHAREHOLDER_CACHE_TTL_HOURS:
+                return pd.read_json(io.StringIO(payload))
+        except (ValueError, TypeError):
+            pass
+
+    api_key = get_secret("INVEZGO_API_KEY")
+    try:
+        r = requests.get(
+            f"{BASE_URL}/analysis/insider/stock/{code}",
+            params={"from": frm, "to": to},
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=30,
+        )
+    except requests.RequestException:
+        return pd.read_json(io.StringIO(payload)) if payload else None
+    if r.status_code in (204, 401, 402, 404, 429):
+        return pd.read_json(io.StringIO(payload)) if payload else None
+    r.raise_for_status()
+    data = r.json()
+    if not data:
+        return None
+    df = pd.DataFrame(data)
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+        df = df.sort_values("date", ascending=False).reset_index(drop=True)
+    db_set_kv(key, df.to_json(), _wib_now().isoformat())
+    return df
+
+
+def insider_verdict(insider_df: pd.DataFrame, days: int = 90):
+    """
+    Ringkasan sederhana: dalam `days` hari terakhir, insider net beli atau
+    net jual? Kolom yang dipakai fleksibel karena skema tiap API insider
+    beda-beda -- coba beberapa nama kolom umum.
+    """
+    if insider_df is None or insider_df.empty or "date" not in insider_df.columns:
+        return None
+    cutoff = date.today() - timedelta(days=days)
+    recent = insider_df[insider_df["date"] >= cutoff].copy()
+    if recent.empty:
+        return {"net_transactions": 0, "verdict": "TIDAK ADA TRANSAKSI", "count": 0}
+
+    vol_col = next((c for c in ["volume", "shares", "amount", "value"] if c in recent.columns), None)
+    action_col = next((c for c in ["action", "type", "transaction_type"] if c in recent.columns), None)
+    if vol_col is None or action_col is None:
+        return {"net_transactions": None, "verdict": "-", "count": len(recent)}
+
+    recent[vol_col] = pd.to_numeric(recent[vol_col], errors="coerce").fillna(0)
+    is_buy = recent[action_col].astype(str).str.lower().str.contains("buy|beli")
+    net = float(recent.loc[is_buy, vol_col].sum() - recent.loc[~is_buy, vol_col].sum())
+    verdict = "NET BELI (akumulasi insider)" if net > 0 else (
+        "NET JUAL (distribusi insider)" if net < 0 else "SEIMBANG"
+    )
+    return {"net_transactions": net, "verdict": verdict, "count": len(recent)}
+
+
 def broker_top3_accumulate(summary: pd.DataFrame):
     """
     Filter '3 broker teratas ngumpulin, broker #1 >= 2x broker #2'.
@@ -1149,6 +1268,45 @@ if mode == "Analisis Satu Saham":
         )
     else:
         st.caption("Tidak ada broker dengan net akumulasi positif dalam 30 hari terakhir, atau data broker tidak cukup.")
+
+    # --- Kepemilikan: shareholder & insider ---
+    st.subheader("🏛️ Kepemilikan (Shareholder & Insider)")
+    st.caption(
+        "Versi ringkas — komposisi pemegang >1% (terbit bulanan) & transaksi "
+        "insider wajib lapor. BUKAN rekonsiliasi ke broker/pasar negosiasi atau "
+        "graf relasi antar-entitas (itu laporan terpisah, di luar scope app ini)."
+    )
+    sh_col, ins_col = st.columns(2)
+
+    with sh_col:
+        st.markdown("**Komposisi Pemegang Saham (>1%)**")
+        shareholders = fetch_shareholders(ticker)
+        if shareholders is not None and not shareholders.empty:
+            show_cols = [c for c in ["name", "percentage", "shares", "type"] if c in shareholders.columns]
+            st.dataframe(
+                shareholders[show_cols] if show_cols else shareholders,
+                use_container_width=True, hide_index=True, height=280,
+            )
+        else:
+            st.caption("Data shareholder tidak tersedia / endpoint butuh paket tertentu.")
+
+    with ins_col:
+        st.markdown(f"**Transaksi Insider ({INSIDER_LOOKBACK_MONTHS} bulan terakhir)**")
+        insider_df = fetch_insider_transactions(ticker)
+        if insider_df is not None and not insider_df.empty:
+            verdict = insider_verdict(insider_df)
+            if verdict and verdict["count"] > 0:
+                st.metric(
+                    "Verdict 90 hari terakhir", verdict["verdict"],
+                    delta=f"{verdict['count']} transaksi",
+                )
+            show_cols = [c for c in ["date", "name", "action", "volume", "price"] if c in insider_df.columns]
+            st.dataframe(
+                insider_df[show_cols] if show_cols else insider_df,
+                use_container_width=True, hide_index=True, height=230,
+            )
+        else:
+            st.caption("Tidak ada laporan insider dalam periode ini / endpoint butuh paket tertentu.")
 
     # --- Analisis AI (Groq) ---
     st.subheader("🤖 Analisis AI (Groq)")

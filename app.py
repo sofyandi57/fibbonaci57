@@ -735,17 +735,35 @@ def fetch_broker_summary(code: str, window: int, investor: str = "all"):
 # --------------------------------------------------------------------------
 BIG_MONEY_TICKET_THRESHOLD = 50_000_000  # rata-rata nilai per transaksi (Rp) di atas ini dianggap "Big Money"
 
+# Override manual dari user (bukan tebakan/hafalan Claude -- lihat catatan
+# ANTI_HALLUCINATION_NOTE soal risiko mengarang klasifikasi broker dari
+# memori). Ini SELALU menang atas heuristik tiket & hasil investor=f/d,
+# karena identitas broker (siapa afiliasinya) itu fakta statis, bukan
+# sesuatu yang bisa disimpulkan salah dari data transaksi satu window.
+# Tambahkan/koreksi di sini kalau ada broker lain yang salah kategori.
+KNOWN_BROKER_CATEGORY = {
+    "XL": "RETAIL", "XC": "RETAIL", "PD": "RETAIL", "YP": "RETAIL",
+    "AK": "FOREIGN", "BK": "FOREIGN", "ZP": "FOREIGN", "YU": "FOREIGN",
+    "MG": "BIG MONEY", "CP": "BIG MONEY", "LG": "BIG MONEY", "RF": "BIG MONEY",
+}
+
 
 def build_broker_category_map(code: str, window: int = 60):
     """
     Petakan tiap kode broker yang aktif di saham ini -> 'FOREIGN' / 'BIG MONEY'
-    / 'RETAIL', dari agregat window (2 panggilan API: investor=f & investor=d),
-    bukan per-hari -- klasifikasi dianggap stabil dalam window ini.
+    / 'RETAIL'. Urutan prioritas: (1) KNOWN_BROKER_CATEGORY (fakta identitas
+    broker, dikonfirmasi manual) selalu menang, (2) investor=f dari API untuk
+    kode yang tidak ada di daftar manual, (3) heuristik tiket rata-rata
+    (investor=d) sebagai fallback terakhir kalau broker benar-benar belum
+    dikenal -- yang PALING rawan salah, jangan dianggap otoritatif.
     """
     foreign_df = fetch_broker_summary(code, window, investor="f")
     domestic_df = fetch_broker_summary(code, window, investor="d")
 
     category = {}
+
+    # (1) API investor=f dan heuristik tiket investor=d -- hanya untuk
+    # broker yang benar-benar tercatat aktif di saham ini.
     if foreign_df is not None and not foreign_df.empty and "code" in foreign_df.columns:
         for c in foreign_df["code"]:
             category[str(c)] = "FOREIGN"
@@ -760,8 +778,14 @@ def build_broker_category_map(code: str, window: int = 60):
         avg_ticket = (buy_val + sell_val) / total_freq
         for c, ticket in zip(df["code"], avg_ticket):
             if str(c) in category:
-                continue  # sudah masuk FOREIGN, jangan ditimpa
+                continue  # sudah masuk FOREIGN dari API, jangan ditimpa heuristik
             category[str(c)] = "BIG MONEY" if pd.notna(ticket) and ticket >= BIG_MONEY_TICKET_THRESHOLD else "RETAIL"
+
+    # (2) Override manual SELALU MENANG, dipasang TERAKHIR & tidak bergantung
+    # pada apakah broker itu muncul di hasil investor=f/d -- identitas broker
+    # tidak berubah walau panggilan API investor=d untuk saham ini gagal/
+    # kosong (dicurigai kadang terjadi, lihat diagnostik di UI).
+    category.update(KNOWN_BROKER_CATEGORY)
 
     return category
 
@@ -2836,18 +2860,22 @@ if mode == "Analisis Satu Saham":
             price_df, net_pivot = inventory_to_frames(inv_data)
             if not net_pivot.empty:
                 category_map = build_broker_category_map(ticker)
-                if not category_map:
-                    st.warning(
-                        "⚠️ Segmentasi broker (Retail/Big Money/Foreign) gagal diambil "
-                        "untuk ticker ini — endpoint investor=f/d mungkin butuh paket "
-                        "lebih tinggi atau tidak ada data. Filter kategori di bawah "
-                        "tidak akan menampilkan hasil selain 'Semua'."
+                active_categories = [category_map.get(str(b), "RETAIL") for b in net_pivot.index]
+                n_foreign = active_categories.count("FOREIGN")
+                n_big = active_categories.count("BIG MONEY")
+                n_retail = active_categories.count("RETAIL")
+                n_known = sum(1 for b in net_pivot.index if str(b) in KNOWN_BROKER_CATEGORY)
+                st.caption(
+                    f"Broker aktif di saham ini: {n_foreign} Foreign, {n_big} Big Money, "
+                    f"{n_retail} Retail ({n_known} dari {len(net_pivot.index)} dikonfirmasi manual, "
+                    "sisanya via investor=f/d API atau heuristik tiket)."
+                )
+                if n_known == 0:
+                    st.caption(
+                        "⚠️ Tidak ada broker di daftar konfirmasi manual yang aktif di sini — "
+                        "klasifikasi murni dari API investor=f/d/heuristik, bisa kurang akurat "
+                        "(lihat catatan di atas)."
                     )
-                else:
-                    n_foreign = sum(1 for v in category_map.values() if v == "FOREIGN")
-                    n_big = sum(1 for v in category_map.values() if v == "BIG MONEY")
-                    n_retail = sum(1 for v in category_map.values() if v == "RETAIL")
-                    st.caption(f"Segmentasi broker terklasifikasi: {n_foreign} Foreign, {n_big} Big Money, {n_retail} Retail.")
 
                 cat_choice = st.radio(
                     "Filter kategori broker", ["Semua", "Retail", "Big Money", "Foreign"],

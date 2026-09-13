@@ -34,6 +34,21 @@ import streamlit as st
 BASE_URL = "https://api.invezgo.com"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL_DEFAULT = "llama-3.1-8b-instant"
+# Urutan model yang dicoba otomatis kalau model utama 404/decommissioned.
+# Model yang tersedia berubah-ubah di sisi Groq, jadi app auto-rotate
+# ke kandidat berikutnya alih-alih langsung gagal.
+GROQ_MODEL_CANDIDATES = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "llama3-70b-8192",
+    "llama3-8b-8192",
+    "gemma2-9b-it",
+    "mixtral-8x7b-32768",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3-32b",
+    "moonshotai/kimi-k2-instruct",
+]
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fib_cache.db")
 
 FIB_LEVELS = [0.0, 0.382, 0.5, 0.618, 0.786, 1.0]
@@ -497,13 +512,30 @@ def broker_top3_accumulate(summary: pd.DataFrame):
 # --------------------------------------------------------------------------
 # GROQ AI
 # --------------------------------------------------------------------------
-@st.cache_data(ttl=1800, show_spinner="🤖 Groq sedang menganalisis…")
-def groq_chat(prompt: str) -> str:
-    key = get_secret("GROQ_API_KEY")
+def _groq_model_order() -> list:
+    """Urutan model dicoba: override secrets dulu, lalu model terakhir yang
+    terbukti jalan di sesi ini, lalu daftar kandidat bawaan (tanpa duplikat)."""
+    order = []
     try:
-        model = st.secrets.get("GROQ_MODEL", GROQ_MODEL_DEFAULT)
+        override = st.secrets.get("GROQ_MODEL")
     except (FileNotFoundError, KeyError):
-        model = GROQ_MODEL_DEFAULT
+        override = None
+    if override:
+        order.append(override)
+    last_working = st.session_state.get("groq_last_working_model")
+    if last_working:
+        order.append(last_working)
+    order += GROQ_MODEL_CANDIDATES
+    seen, dedup = set(), []
+    for m in order:
+        if m not in seen:
+            seen.add(m)
+            dedup.append(m)
+    return dedup
+
+
+def _groq_call(key: str, model: str, prompt: str):
+    """Satu percobaan panggilan Groq. Return (status, text_or_content)."""
     r = requests.post(
         GROQ_URL,
         headers={"Authorization": f"Bearer {key}"},
@@ -528,25 +560,53 @@ def groq_chat(prompt: str) -> str:
         allow_redirects=False,
     )
     if r.is_redirect or r.status_code in (301, 302, 303, 307, 308):
-        return (
-            f"❌ Groq redirect ke '{r.headers.get('Location')}' — permintaan POST "
-            "berubah jadi GET dan gagal. Cek GROQ_URL sudah benar-benar "
-            "'https://api.groq.com/openai/v1/chat/completions' (huruf besar/kecil, "
-            "trailing slash)."
-        )
+        return "redirect", r.headers.get("Location", "?")
     if r.status_code == 401:
-        return "❌ GROQ_API_KEY tidak valid."
+        return "auth", None
     if r.status_code == 404:
-        return (
-            f"❌ Groq 404 ({model}): {r.text}\n\n"
-            "Model ini mungkin sudah tidak tersedia. Cek daftar model aktif di "
-            "https://console.groq.com/docs/models, lalu set `GROQ_MODEL` di "
-            "Streamlit Secrets ke model yang tersedia untuk akunmu."
-        )
+        return "not_found", r.text
     if r.status_code == 429:
-        return "⏳ Rate limit Groq — coba beberapa saat lagi."
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
+        return "rate_limit", None
+    if not r.ok:
+        return "error", f"{r.status_code}: {r.text}"
+    return "ok", r.json()["choices"][0]["message"]["content"]
+
+
+@st.cache_data(ttl=1800, show_spinner="🤖 Groq sedang menganalisis…")
+def groq_chat(prompt: str) -> str:
+    key = get_secret("GROQ_API_KEY")
+    tried, not_found = [], []
+
+    for model in _groq_model_order():
+        status, payload = _groq_call(key, model, prompt)
+        tried.append(model)
+
+        if status == "ok":
+            st.session_state["groq_last_working_model"] = model
+            return payload
+        if status == "auth":
+            return "❌ GROQ_API_KEY tidak valid."
+        if status == "redirect":
+            return (
+                f"❌ Groq redirect ke '{payload}' — permintaan POST berubah jadi "
+                "GET dan gagal. Cek GROQ_URL sudah benar-benar "
+                "'https://api.groq.com/openai/v1/chat/completions'."
+            )
+        if status == "not_found":
+            not_found.append(model)
+            continue  # auto-rotate ke kandidat berikutnya
+        if status == "rate_limit":
+            continue  # coba model lain, bukan nyerah
+        if status == "error":
+            continue  # error lain, tetap coba kandidat berikutnya
+
+    return (
+        f"❌ Semua {len(tried)} model Groq yang dicoba gagal ({', '.join(tried)}). "
+        f"Model tidak ditemukan: {', '.join(not_found) or '-'}.\n\n"
+        "Cek daftar model aktif untuk akunmu di "
+        "https://console.groq.com/docs/models, lalu set `GROQ_MODEL` di "
+        "Streamlit Secrets ke salah satu yang tersedia."
+    )
 
 
 def build_analysis_prompt(code, structure, sig, retr, ext, recent_closes):

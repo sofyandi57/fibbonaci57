@@ -1785,25 +1785,71 @@ ANTI_HALLUCINATION_NOTE = (
 )
 
 
-def build_analysis_prompt(code, structure, sig, retr, ext, recent_closes):
+def build_analysis_prompt(code, structure, sig, retr, ext, recent_closes,
+                           bdm_info=None, binfo=None, trend_info=None,
+                           insider_info=None, verdict=None):
+    """
+    Prompt lengkap untuk panel 'Analisis AI (Groq)' -- sebelumnya HANYA
+    berisi data teknikal fibonacci, sama sekali tidak menyertakan hasil
+    tab Bandarmologi (BDM, konsentrasi broker, akumulator aktif, insider,
+    kesimpulan gabungan) walau semua itu sudah dihitung di halaman yang
+    sama. Sekarang semua konteks itu disisipkan supaya Groq benar-benar
+    menganalisis gabungan teknikal + bandarmologi, bukan cuma teknikal.
+    """
     closes_str = ", ".join(f"{c:,.0f}" for c in recent_closes)
     fib_str = ", ".join(f"{l*100:.1f}%={retr[l]:,.0f}" for l in FIB_LEVELS)
     profile = company_profile_line(code)
-    return f"""Analisis teknikal singkat saham {code} (IDX):
+
+    bandar_lines = []
+    if bdm_info:
+        bandar_lines.append(
+            f"- BDM: {bdm_info.get('stage')} (dominasi akumulasi {bdm_info.get('acc_pct'):.0f}% hari, "
+            f"volume {bdm_info.get('vol_ratio'):.2f}x rata-rata, range sideways {bdm_info.get('range_pct'):.1f}%)"
+        )
+    if binfo:
+        status = "LOLOS (top-3 broker terkonsentrasi & net beli semua)" if binfo.get("broker_filter_pass") else "GAGAL"
+        bandar_lines.append(
+            f"- Top-3 broker (20 hari): #1 {binfo.get('b1')}, #2 {binfo.get('b2')}, #3 {binfo.get('b3')}, "
+            f"rasio #1:#2={binfo.get('ratio_1v2'):.2f}x, filter konsentrasi: {status}"
+        )
+    if trend_info:
+        bandar_lines.append(
+            f"- Akumulator terbesar 30 hari: broker {trend_info.get('broker')}, status {trend_info.get('verdict')}"
+        )
+    if insider_info and insider_info.get("count", 0) > 0:
+        bandar_lines.append(
+            f"- Insider 90 hari terakhir: {insider_info.get('verdict')} ({insider_info.get('count')} transaksi)"
+        )
+    if verdict:
+        bandar_lines.append(
+            f"- Kesimpulan gabungan sistem (skor rule-based, BUKAN dari AI): "
+            f"{verdict.get('verdict')} (skor {verdict.get('score'):+d}) -- alasan: "
+            + "; ".join(verdict.get("reasons", [])) if verdict.get("reasons") else
+            f"- Kesimpulan gabungan sistem: {verdict.get('verdict')} (skor {verdict.get('score'):+d})"
+        )
+    bandar_block = "\n".join(bandar_lines) if bandar_lines else "(data bandarmologi tidak tersedia)"
+
+    return f"""Analisis saham {code} (IDX) -- gabungan teknikal & bandarmologi:
 
 PROFIL PERUSAHAAN: {profile}
+
+TEKNIKAL:
 MARKET STRUCTURE: {structure}
 LEVEL FIBONACCI (swing low->high): {fib_str}
 SINYAL: {sig['signal']} (level {sig['fib_level']})
 RENCANA: entry={sig['entry']}, SL={sig['stop_loss']}, TP1={sig['tp1']}, TP2={sig['tp2']}, TP3={sig['tp3']}, risiko={sig['risk_pct']:.2f}%
 10 CLOSE TERAKHIR: {closes_str}
+
+BANDARMOLOGI:
+{bandar_block}
 {ANTI_HALLUCINATION_NOTE}
 
 Tugas:
-1. Evaluasi kualitas setup ini (apakah weak/strong pullback masuk akal?).
-2. Apa konfirmasi tambahan yang sebaiknya ditunggu sebelum entry?
-3. Risiko utama skenario ini.
-4. Catatan money management."""
+1. Evaluasi kualitas setup ini secara TEKNIKAL (apakah weak/strong pullback masuk akal?).
+2. Apakah data BANDARMOLOGI di atas MENDUKUNG atau BERTENTANGAN dengan sinyal teknikalnya? Jelaskan kenapa.
+3. Apa konfirmasi tambahan yang sebaiknya ditunggu sebelum entry?
+4. Risiko utama skenario ini.
+5. Catatan money management."""
 
 
 # --------------------------------------------------------------------------
@@ -2862,12 +2908,17 @@ if mode == "Analisis Satu Saham":
         with ins_col:
             st.markdown(f"**Transaksi Insider ({INSIDER_LOOKBACK_MONTHS} bulan terakhir)**")
             insider_df, ins_err = fetch_insider_transactions(ticker)
+            insider_verdict_info = None
             if insider_df is not None and not insider_df.empty:
-                verdict = insider_verdict(insider_df)
-                if verdict and verdict["count"] > 0:
+                # NB: variabel ini SENGAJA tidak dinamai "verdict" -- nama itu
+                # sudah dipakai combined_verdict() di atas untuk kesimpulan
+                # gabungan sistem; menimpanya di sini pernah membuat prompt
+                # Groq salah membaca kesimpulan gabungan (bug lama).
+                insider_verdict_info = insider_verdict(insider_df)
+                if insider_verdict_info and insider_verdict_info["count"] > 0:
                     st.metric(
-                        "Verdict 90 hari terakhir", verdict["verdict"],
-                        delta=f"{verdict['count']} transaksi",
+                        "Verdict 90 hari terakhir", insider_verdict_info["verdict"],
+                        delta=f"{insider_verdict_info['count']} transaksi",
                     )
                 show_cols = [c for c in ["date", "name", "badge", "action", "volume", "price"] if c in insider_df.columns]
                 st.dataframe(
@@ -3057,6 +3108,8 @@ if mode == "Analisis Satu Saham":
         prompt = build_analysis_prompt(
             ticker, structure, sig, retr, ext,
             [float(x) for x in df["close"].tail(10)],
+            bdm_info=bdm_info, binfo=binfo, trend_info=trend_info,
+            insider_info=insider_verdict_info, verdict=verdict,
         )
         try:
             st.markdown(groq_chat(prompt))

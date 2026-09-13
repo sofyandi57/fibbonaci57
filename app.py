@@ -18,6 +18,7 @@ Disclaimer: aplikasi ini untuk EDUKASI, bukan rekomendasi beli/jual.
 """
 
 import io
+import json
 import os
 import re
 import sqlite3
@@ -25,6 +26,7 @@ import time
 from datetime import date, timedelta
 
 import matplotlib.pyplot as plt
+import networkx as nx
 import pandas as pd
 import requests
 import streamlit as st
@@ -634,6 +636,199 @@ def insider_verdict(insider_df: pd.DataFrame, days: int = 90):
     return {"net_transactions": net, "verdict": verdict, "count": len(recent)}
 
 
+# --------------------------------------------------------------------------
+# LAPIS A LANJUTAN: riwayat bulanan pemegang >1% + graf relasi
+# LAPIS B+C: rekonsiliasi insider <-> broker pasar negosiasi (NG)
+# Konsep diambil dari analisa-kepemilikan.skill, diringkas untuk konteks
+# app interaktif (bukan laporan HTML statis): tanpa penelusuran rantai
+# korporasi berjenjang (endpoint tidak menyediakan edge entity->entity) dan
+# tanpa scan harian menyeluruh pasar NG di luar tanggal insider (itu akan
+# butuh 1 panggilan API per hari dalam window -- terlalu berat untuk app
+# yang dipanggil live oleh banyak user, beda dengan skill laporan offline
+# yang dijalankan sekali per permintaan oleh agent).
+# --------------------------------------------------------------------------
+
+def fetch_shareholder_detail(code: str):
+    """
+    Riwayat BULANAN pemegang saham >1% (Lapis A time series, beda dari
+    fetch_shareholders() yang cuma snapshot terbaru).
+    Endpoint: GET /analysis/shareholder-detail/{code} -- verified api-1.json.
+    """
+    key = f"{code}|shareholder-detail"
+    payload, fetched_at = db_get_kv(key)
+    if payload and fetched_at:
+        try:
+            age_hours = (_wib_now() - _dt.fromisoformat(fetched_at)).total_seconds() / 3600
+            if age_hours < SHAREHOLDER_CACHE_TTL_HOURS:
+                return pd.read_json(io.StringIO(payload)), None
+        except (ValueError, TypeError):
+            pass
+
+    api_key = get_secret("INVEZGO_API_KEY")
+    url = f"{BASE_URL}/analysis/shareholder-detail/{code}"
+    try:
+        r = requests.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=30)
+    except requests.RequestException as e:
+        cached = pd.read_json(io.StringIO(payload)) if payload else None
+        return cached, f"Request error: {e}"
+    if not r.ok:
+        cached = pd.read_json(io.StringIO(payload)) if payload else None
+        hint = _STATUS_HINT.get(r.status_code, f"{r.status_code}")
+        return cached, f"GET {url} -> {hint} | body: {r.text[:300]}"
+    data = r.json()
+    if not data:
+        return None, None
+    df = pd.DataFrame(data)
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+    for col in ("percent", "val"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.sort_values(["name", "date"]).reset_index(drop=True)
+    db_set_kv(key, df.to_json(), _wib_now().isoformat())
+    return df, None
+
+
+def shareholder_monthly_changes(detail_df: pd.DataFrame, min_change_pct: float = 0.1):
+    """
+    Dari riwayat bulanan per pemegang, hitung perubahan persentase
+    bulan-ke-bulan per nama, filter yang berubah >= min_change_pct poin
+    persen -- ini jadi "peristiwa Lapis A" untuk timeline.
+    """
+    if detail_df is None or detail_df.empty:
+        return pd.DataFrame()
+    rows = []
+    for name, grp in detail_df.groupby("name"):
+        grp = grp.sort_values("date")
+        prev_pct = None
+        for _, row in grp.iterrows():
+            if prev_pct is not None and pd.notna(row.get("percent")):
+                delta = row["percent"] - prev_pct
+                if abs(delta) >= min_change_pct:
+                    rows.append({
+                        "date": row["date"], "name": name,
+                        "percent": row["percent"], "change": delta,
+                    })
+            prev_pct = row.get("percent")
+    return pd.DataFrame(rows).sort_values("date", ascending=False).reset_index(drop=True) if rows else pd.DataFrame()
+
+
+def fetch_shareholder_relation(code: str, depth: int = 3, min_percentage: float = 1, max_nodes: int = 80, neighbors: int = 20):
+    """
+    Graf relasi kepemilikan (irisan kepemilikan antar entitas/saham, BUKAN
+    rantai korporasi berjenjang -- endpoint ini tidak menyediakan edge
+    entity->entity, hanya entity<->stock berdasarkan siapa memegang saham
+    yang sama).
+    Endpoint: GET /analysis/shareholder/relation -- verified api-1.json.
+    """
+    key = f"{code}|relation|{depth}|{min_percentage}|{max_nodes}|{neighbors}"
+    payload, fetched_at = db_get_kv(key)
+    if payload and fetched_at:
+        try:
+            age_hours = (_wib_now() - _dt.fromisoformat(fetched_at)).total_seconds() / 3600
+            if age_hours < SHAREHOLDER_CACHE_TTL_HOURS:
+                return json.loads(payload), None
+        except (ValueError, TypeError, json.JSONDecodeError):
+            pass
+
+    api_key = get_secret("INVEZGO_API_KEY")
+    url = f"{BASE_URL}/analysis/shareholder/relation"
+    try:
+        r = requests.get(
+            url,
+            params={"code": code, "depth": depth, "min_percentage": min_percentage,
+                    "max_nodes": max_nodes, "neighbors": neighbors},
+            headers={"Authorization": f"Bearer {api_key}"}, timeout=45,
+        )
+    except requests.RequestException as e:
+        cached = json.loads(payload) if payload else None
+        return cached, f"Request error: {e}"
+    if not r.ok:
+        cached = json.loads(payload) if payload else None
+        hint = _STATUS_HINT.get(r.status_code, f"{r.status_code}")
+        return cached, f"GET {url} -> {hint} | body: {r.text[:300]}"
+    data = r.json()
+    if not data or not data.get("nodes"):
+        return None, None
+    db_set_kv(key, json.dumps(data), _wib_now().isoformat())
+    return data, None
+
+
+def fetch_ng_daily_summary(code: str, day: date):
+    """
+    Broker summary pasar NEGOSIASI (NG) untuk SATU hari spesifik -- dipakai
+    untuk merekonsiliasi transaksi insider ke broker pelaksana. Beda dari
+    fetch_broker_summary() yang agregat multi-hari & market RG.
+    """
+    day_str = day.isoformat()
+    key = f"{code}|ng|{day_str}"
+    payload, fetched_at = db_get_kv(key)
+    if payload and fetched_at:
+        return pd.read_json(io.StringIO(payload)) if payload != "[]" else pd.DataFrame()
+
+    api_key = get_secret("INVEZGO_API_KEY")
+    try:
+        r = requests.get(
+            f"{BASE_URL}/analysis/summary/stock/{code}",
+            params={"from": day_str, "to": day_str, "investor": "all", "market": "NG"},
+            headers={"Authorization": f"Bearer {api_key}"}, timeout=30,
+        )
+    except requests.RequestException:
+        return pd.DataFrame()
+    if not r.ok:
+        return pd.DataFrame()
+    data = r.json()
+    db_set_kv(key, json.dumps(data) if data else "[]", _wib_now().isoformat())
+    if not data:
+        return pd.DataFrame()
+    df = pd.DataFrame(data)
+    for col in ["buy_volume", "sell_volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    return df
+
+
+def reconcile_insider_to_broker(code: str, insider_df: pd.DataFrame, tolerance: float = 0.05):
+    """
+    Untuk tiap transaksi insider, cari broker di pasar NG pada tanggal yang
+    sama dengan volume beli/jual paling mendekati volume transaksi insider.
+    Match dianggap 'COCOK PERSIS' kalau selisih <1 lembar, 'COCOK PARSIAL'
+    kalau dalam toleransi (`tolerance`), selain itu 'TIDAK DITEMUKAN'
+    (transaksi kemungkinan di luar bursa, atau di market RG bukan NG).
+    Hanya menyisir tanggal-tanggal yang PUNYA laporan insider -- TIDAK
+    menyisir seluruh pasar NG tanpa insider (lihat catatan modul di atas).
+    """
+    if insider_df is None or insider_df.empty:
+        return pd.DataFrame()
+
+    results = []
+    for _, tx in insider_df.iterrows():
+        ng = fetch_ng_daily_summary(code, tx["date"])
+        is_buy = str(tx.get("action", "")).lower().startswith(("buy", "beli"))
+        vol_col = "buy_volume" if is_buy else "sell_volume"
+        broker_col = "code" if "code" in ng.columns else None
+        match_broker, match_status = None, "TIDAK DITEMUKAN"
+
+        if not ng.empty and vol_col in ng.columns and broker_col:
+            target = float(tx.get("volume") or 0)
+            if target > 0:
+                ng = ng.copy()
+                ng["_diff"] = (ng[vol_col] - target).abs()
+                best = ng.sort_values("_diff").iloc[0]
+                rel_diff = best["_diff"] / target if target else 1.0
+                if rel_diff < 1e-6:
+                    match_broker, match_status = str(best[broker_col]), "COCOK PERSIS"
+                elif rel_diff <= tolerance:
+                    match_broker, match_status = str(best[broker_col]), "COCOK PARSIAL"
+
+        results.append({
+            "date": tx["date"], "name": tx.get("name"), "action": tx.get("action"),
+            "volume": tx.get("volume"), "price": tx.get("price"),
+            "broker": match_broker, "status": match_status,
+        })
+    return pd.DataFrame(results)
+
+
 def broker_top3_accumulate(summary: pd.DataFrame):
     """
     Filter '3 broker teratas ngumpulin, broker #1 >= 2x broker #2'.
@@ -1144,6 +1339,28 @@ def plot_volume_30d(df, window: int = 30):
     return fig
 
 
+def plot_shareholder_relation(relation_data: dict, root_code: str):
+    """Graf relasi kepemilikan (node-link) pakai networkx -- root disorot merah."""
+    g = nx.Graph()
+    for n in relation_data.get("nodes", []):
+        g.add_node(n["id"], label=n.get("label", n["id"]), root=n.get("root", False))
+    for e in relation_data.get("edges", []):
+        if e["source"] in g.nodes and e["target"] in g.nodes:
+            g.add_edge(e["source"], e["target"], weight=e.get("percentage", 1))
+
+    fig, ax = plt.subplots(figsize=(11, 8))
+    pos = nx.spring_layout(g, k=0.6, seed=42)
+    node_colors = ["#e74c3c" if g.nodes[n].get("root") else "#3498db" for n in g.nodes]
+    node_sizes = [700 if g.nodes[n].get("root") else 350 for n in g.nodes]
+    nx.draw_networkx_edges(g, pos, ax=ax, alpha=0.4, edge_color="#999")
+    nx.draw_networkx_nodes(g, pos, ax=ax, node_color=node_colors, node_size=node_sizes)
+    labels = {n: g.nodes[n]["label"] for n in g.nodes}
+    nx.draw_networkx_labels(g, pos, labels=labels, ax=ax, font_size=7)
+    ax.set_title(f"Graf Relasi Kepemilikan — {root_code} (merah = root)")
+    ax.axis("off")
+    return fig
+
+
 # --------------------------------------------------------------------------
 # UI
 # --------------------------------------------------------------------------
@@ -1302,14 +1519,17 @@ if mode == "Analisis Satu Saham":
     # --- Kepemilikan: shareholder & insider ---
     st.subheader("🏛️ Kepemilikan (Shareholder & Insider)")
     st.caption(
-        "Versi ringkas — komposisi pemegang >1% (terbit bulanan) & transaksi "
-        "insider wajib lapor. BUKAN rekonsiliasi ke broker/pasar negosiasi atau "
-        "graf relasi antar-entitas (itu laporan terpisah, di luar scope app ini)."
+        "Porting dari konsep skill analisa-kepemilikan: komposisi terbaru, riwayat "
+        "bulanan, graf relasi, rekonsiliasi insider↔broker pasar negosiasi (NG), "
+        "dirangkai jadi timeline. TIDAK menelusuri rantai korporasi berjenjang "
+        "(endpoint relation cuma punya irisan kepemilikan, bukan edge entity→entity) "
+        "dan TIDAK menyisir seluruh pasar NG tanpa laporan insider (butuh 1 panggilan "
+        "API per hari dalam window — terlalu berat untuk app live)."
     )
     sh_col, ins_col = st.columns(2)
 
     with sh_col:
-        st.markdown("**Komposisi Pemegang Saham (>1%)**")
+        st.markdown("**Komposisi Pemegang Saham (>1%, snapshot terbaru)**")
         shareholders, sh_err = fetch_shareholders(ticker)
         if shareholders is not None and not shareholders.empty:
             show_cols = [c for c in ["name", "percentage", "badge"] if c in shareholders.columns]
@@ -1341,6 +1561,65 @@ if mode == "Analisis Satu Saham":
             st.error(f"❌ Insider gagal diambil: {ins_err}")
         else:
             st.caption("Tidak ada laporan insider dalam periode ini.")
+
+    with st.expander("🕸️ Graf Relasi Kepemilikan"):
+        st.caption(
+            "Irisan kepemilikan (siapa memegang saham yang sama) — BUKAN rantai "
+            "korporasi berjenjang. Merah = saham ini, biru = entitas/saham terkait."
+        )
+        relation_data, rel_err = fetch_shareholder_relation(ticker)
+        if relation_data:
+            st.pyplot(plot_shareholder_relation(relation_data, ticker), use_container_width=True)
+        elif rel_err:
+            st.error(f"❌ Graf relasi gagal diambil: {rel_err}")
+        else:
+            st.caption("Tidak ada relasi kepemilikan >1% yang ditemukan untuk ticker ini.")
+
+    with st.expander("📜 Riwayat Bulanan Pemegang >1% (perubahan signifikan)"):
+        detail_df, det_err = fetch_shareholder_detail(ticker)
+        if det_err:
+            st.error(f"❌ Riwayat shareholder gagal diambil: {det_err}")
+        elif detail_df is not None and not detail_df.empty:
+            changes = shareholder_monthly_changes(detail_df)
+            if not changes.empty:
+                st.dataframe(changes, use_container_width=True, hide_index=True, height=250)
+            else:
+                st.caption("Tidak ada perubahan kepemilikan signifikan (≥0.1 poin persen) antar-bulan.")
+        else:
+            st.caption("Tidak ada riwayat bulanan untuk ticker ini.")
+
+    with st.expander("🔍 Rekonsiliasi Insider ↔ Broker Pasar Negosiasi (NG)"):
+        st.caption(
+            "Untuk tiap transaksi insider, dicari broker NG di tanggal yang sama "
+            "dengan volume paling mendekati. Kalau tidak ketemu, transaksinya bisa "
+            "di market RG biasa (bukan NG) atau di luar bursa."
+        )
+        if insider_df is not None and not insider_df.empty:
+            recon = reconcile_insider_to_broker(ticker, insider_df)
+            st.dataframe(recon, use_container_width=True, hide_index=True, height=250)
+        else:
+            st.caption("Tidak ada transaksi insider untuk direkonsiliasi.")
+
+    with st.expander("🗓️ Timeline Kepemilikan Gabungan (Lapis A + B)"):
+        events = []
+        if det_err is None and detail_df is not None and not detail_df.empty:
+            changes = shareholder_monthly_changes(detail_df)
+            for _, row in changes.iterrows():
+                events.append({
+                    "date": row["date"], "lapis": "A — Struktur",
+                    "peristiwa": f"{row['name']}: {row['change']:+.2f}pp → {row['percent']:.2f}%",
+                })
+        if insider_df is not None and not insider_df.empty:
+            for _, row in insider_df.iterrows():
+                events.append({
+                    "date": row["date"], "lapis": "B — Insider",
+                    "peristiwa": f"{row.get('name')} {row.get('action')} {row.get('volume'):,.0f} lembar @ {row.get('price')}",
+                })
+        if events:
+            timeline = pd.DataFrame(events).sort_values("date", ascending=False).reset_index(drop=True)
+            st.dataframe(timeline, use_container_width=True, hide_index=True, height=300)
+        else:
+            st.caption("Tidak ada peristiwa kepemilikan (Lapis A/B) untuk dirangkai jadi timeline.")
 
     # --- Analisis AI (Groq) ---
     st.subheader("🤖 Analisis AI (Groq)")

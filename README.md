@@ -23,7 +23,7 @@ Data harga diambil dari [InvezGo API](https://invezgo.com).
 | Rencana trading | entry, stop loss, TP1/TP2/TP3, risk-reward |
 | Chart | visualisasi harga vs level fib |
 | **Screener multi-saham** | scan watchlist custom / seluruh IDX, tabel sinyal terfilter, export CSV |
-| **SQLite cache** | data OHLCV **& BDM** disimpan lokal (incremental fetch) — kuota API jauh lebih hemat |
+| **Database cache** | OHLCV **& BDM** di-cache incremental — **Supabase (Postgres, persisten)** atau fallback SQLite lokal |
 | **Analisis AI (Groq)** | komentar teknikal berbahasa Indonesia untuk hasil analisis & screener |
 | **Screener Bandar** | deteksi **akumulasi / distribusi bandar saat sideways** — termasuk fase *dini* sebelum volume breakout (filter: volume > 1.5x rata-rata 20 hari), pakai indikator BDM invEZGo |
 
@@ -61,6 +61,43 @@ Secrets saat runtime:
 
 Dapatkan API key di: <https://invezgo.com/id/setting/api> (memerlukan paket
 langganan aktif — endpoint chart membutuhkan hak akses berbayar).
+
+## 🗄️ Setup Supabase (cache persisten, opsional tapi disarankan)
+
+Filesystem Streamlit Cloud bersifat *ephemeral* — tanpa database eksternal,
+cache hilang tiap redeploy. App ini mendukung **Supabase** otomatis:
+jika secrets Supabase ada → dipakai; jika tidak → fallback SQLite lokal.
+
+1. Buat project gratis di [supabase.com](https://supabase.com) → **New project**.
+2. Buka **SQL Editor**, jalankan:
+   ```sql
+   CREATE TABLE candles (
+     code   TEXT NOT NULL,
+     date   DATE NOT NULL,
+     open   REAL, high REAL, low REAL, close REAL, volume REAL,
+     PRIMARY KEY (code, date)
+   );
+   CREATE INDEX idx_candles_code ON candles(code);
+
+   CREATE TABLE bdm (
+     code  TEXT NOT NULL,
+     date  DATE NOT NULL,
+     value REAL,
+     PRIMARY KEY (code, date)
+   );
+   ```
+3. Ambil kredensial di **Settings → API**:
+   - `Project URL` → masukkan sebagai `SUPABASE_URL`
+   - `anon public key` → masukkan sebagai `SUPABASE_KEY`
+     (tabel di atas default-nya bisa diakses anon; kalau kamu lock dengan
+     RLS, pakai `service_role` key — jangan pernah commit key ini!)
+4. Tambahkan ke Streamlit Secrets (sejajar key lain):
+   ```toml
+   SUPABASE_URL = "https://xxxx.supabase.co"
+   SUPABASE_KEY = "eyJhbGciOi..."
+   ```
+
+Tanpa secrets Supabase, app tetap berjalan penuh dengan SQLite lokal.
 
 ## 🚀 Menjalankan Lokal
 

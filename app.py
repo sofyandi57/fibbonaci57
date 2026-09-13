@@ -9,7 +9,8 @@ Streamlit app yang menganalisis saham IDX dengan:
    (data BDM dari endpoint /analysis/chart/stock/bdm/{code})
 
 Arsitektur:
-- SQLite cache   : OHLCV + BDM disimpan lokal (incremental fetch)
+- Storage cache  : Supabase (Postgres, persisten) jika secrets tersedia,
+                   fallback otomatis ke SQLite lokal
 - InvezGo API    : sumber data (hanya data yang belum ada di cache)
 - Groq API       : komentar analisis AI berbahasa Indonesia
 
@@ -70,8 +71,65 @@ def get_secret(name: str) -> str:
 
 
 # --------------------------------------------------------------------------
-# SQLITE CACHE
+# STORAGE: Supabase (utama) + SQLite (fallback lokal)
 # --------------------------------------------------------------------------
+# Secrets untuk Supabase (opsional — tanpa ini app otomatis pakai SQLite):
+#   SUPABASE_URL = "https://xxxx.supabase.co"
+#   SUPABASE_KEY = "eyJhbGciOi..."   (anon key atau service_role key)
+
+def _use_supabase() -> bool:
+    try:
+        return bool(st.secrets.get("SUPABASE_URL") and st.secrets.get("SUPABASE_KEY"))
+    except (FileNotFoundError, KeyError):
+        return False
+
+
+def _sb_headers() -> dict:
+    key = st.secrets["SUPABASE_KEY"]
+    return {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates",  # upsert
+    }
+
+
+def _sb_get(table: str, code: str, frm: str, to: str):
+    """Baca baris dari Supabase (PostgREST). Return DataFrame atau None."""
+    url = f"{st.secrets['SUPABASE_URL']}/rest/v1/{table}"
+    try:
+        r = requests.get(
+            url,
+            headers=_sb_headers(),
+            params=[
+                ("code", f"eq.{code}"),
+                ("date", f"gte.{frm}"),
+                ("date", f"lte.{to}"),
+                ("order", "date"),
+                ("limit", "10000"),
+            ],
+            timeout=30,
+        )
+    except requests.RequestException:
+        return None
+    if r.status_code != 200 or not r.json():
+        return None
+    df = pd.DataFrame(r.json())
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    for col in df.columns:
+        if col not in ("code", "date"):
+            df[col] = pd.to_numeric(df[col])
+    return df.drop(columns=["code"])
+
+
+def _sb_upsert(table: str, rows: list):
+    """Upsert baris ke Supabase. `rows` = list of dict."""
+    url = f"{st.secrets['SUPABASE_URL']}/rest/v1/{table}"
+    r = requests.post(url, headers=_sb_headers(), json=rows, timeout=60)
+    r.raise_for_status()
+
+
+# ---------- SQLite fallback ----------
 def db_conn():
     return sqlite3.connect(DB_PATH)
 
@@ -102,7 +160,10 @@ def db_init():
 db_init()
 
 
+# ---------- dispatcher: candles ----------
 def db_get_candles(code: str, frm: str, to: str):
+    if _use_supabase():
+        return _sb_get("candles", code, frm, to)
     with db_conn() as con:
         df = pd.read_sql_query(
             "SELECT date, open, high, low, close, volume FROM candles "
@@ -116,6 +177,14 @@ def db_get_candles(code: str, frm: str, to: str):
 
 
 def db_insert_candles(code: str, df: pd.DataFrame):
+    if _use_supabase():
+        rows = [
+            {"code": code, "date": str(r.date), "open": r.open, "high": r.high,
+             "low": r.low, "close": r.close, "volume": r.volume}
+            for r in df.itertuples(index=False)
+        ]
+        _sb_upsert("candles", rows)
+        return
     rows = [
         (code, str(r.date), r.open, r.high, r.low, r.close, r.volume)
         for r in df.itertuples(index=False)
@@ -128,7 +197,10 @@ def db_insert_candles(code: str, df: pd.DataFrame):
         )
 
 
+# ---------- dispatcher: bdm ----------
 def db_get_bdm(code: str, frm: str, to: str):
+    if _use_supabase():
+        return _sb_get("bdm", code, frm, to)
     with db_conn() as con:
         df = pd.read_sql_query(
             "SELECT date, value FROM bdm "
@@ -142,6 +214,11 @@ def db_get_bdm(code: str, frm: str, to: str):
 
 
 def db_insert_bdm(code: str, df: pd.DataFrame):
+    if _use_supabase():
+        rows = [{"code": code, "date": str(r.date), "value": r.value}
+                for r in df.itertuples(index=False)]
+        _sb_upsert("bdm", rows)
+        return
     rows = [(code, str(r.date), r.value) for r in df.itertuples(index=False)]
     with db_conn() as con:
         con.executemany(
@@ -940,9 +1017,10 @@ else:
 with st.expander("ℹ️ Cara membaca"):
     st.markdown(
         """
-        - **SQLite cache** — data OHLCV & BDM disimpan lokal (`fib_cache.db`);
-          app hanya menarik data yang belum ada di cache → kuota invEZGo hemat.
-          Catatan: di Streamlit Cloud, file ini reset saat redeploy/restart.
+        - **Cache database** — data OHLCV & BDM tersimpan di **Supabase**
+          (persisten, shared antar instance) atau fallback SQLite lokal
+          (`fib_cache.db`); app hanya menarik data yang belum ada di cache →
+          kuota invEZGo hemat.
         - **Swing high/low** hanya valid jika candle berikutnya *menutupi body*
           candle sebelum titik tersebut (aturan konfirmasi).
         - **Weak pullback** → harga rebound setelah turun satu level fib:

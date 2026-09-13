@@ -306,25 +306,32 @@ def db_set_kv(key: str, payload: str, fetched_at: str):
 # ---------- dispatcher: watchlist ----------
 def watchlist_add(code: str, entry_price: float, target_price: float | None,
                    stop_loss: float | None, notes: str = ""):
+    """Return error_message_or_None -- ditampilkan ke UI, tidak ditelan raise_for_status()."""
     added_at = _wib_now().isoformat()
     if _use_supabase():
-        url = f"{st.secrets['SUPABASE_URL']}/rest/v1/watchlist"
+        url = f"{_sb_base_url()}/rest/v1/watchlist"
         row = {"code": code, "added_at": added_at, "entry_price": entry_price,
                "target_price": target_price, "stop_loss": stop_loss, "notes": notes}
-        r = requests.post(url, headers=_sb_headers(), json=[row], timeout=30)
-        r.raise_for_status()
-        return
+        try:
+            r = requests.post(url, headers=_sb_headers(), json=[row], timeout=30)
+        except requests.RequestException as e:
+            return f"Request error: {e}"
+        if not r.ok:
+            hint = _STATUS_HINT.get(r.status_code, f"{r.status_code}")
+            return f"POST {url} -> {hint} | body: {r.text[:400]}"
+        return None
     with db_conn() as con:
         con.execute(
             "INSERT INTO watchlist (code, added_at, entry_price, target_price, stop_loss, notes) "
             "VALUES (?,?,?,?,?,?)",
             (code, added_at, entry_price, target_price, stop_loss, notes),
         )
+    return None
 
 
 def watchlist_list() -> pd.DataFrame:
     if _use_supabase():
-        url = f"{st.secrets['SUPABASE_URL']}/rest/v1/watchlist"
+        url = f"{_sb_base_url()}/rest/v1/watchlist"
         try:
             r = requests.get(url, headers=_sb_headers(),
                               params={"order": "added_at.desc"}, timeout=30)
@@ -343,7 +350,7 @@ def watchlist_list() -> pd.DataFrame:
 
 def watchlist_delete(entry_id):
     if _use_supabase():
-        url = f"{st.secrets['SUPABASE_URL']}/rest/v1/watchlist"
+        url = f"{_sb_base_url()}/rest/v1/watchlist"
         requests.delete(url, headers=_sb_headers(), params={"id": f"eq.{entry_id}"}, timeout=30)
         return
     with db_conn() as con:
@@ -3778,14 +3785,17 @@ elif mode == "⭐ Watchlist":
                     st.error(f"Gagal ambil harga {wl_ticker} — cek kode saham / API key.")
                 else:
                     entry_price = float(df_wl["close"].iloc[-1])
-                    watchlist_add(
+                    add_err = watchlist_add(
                         wl_ticker, entry_price,
                         wl_target if wl_target > 0 else None,
                         wl_sl if wl_sl > 0 else None,
                         wl_notes,
                     )
-                    st.success(f"{wl_ticker} ditambahkan ke watchlist @ {id_number(entry_price)}.")
-                    st.rerun()
+                    if add_err:
+                        st.error(f"❌ Gagal simpan ke watchlist: {add_err}")
+                    else:
+                        st.success(f"{wl_ticker} ditambahkan ke watchlist @ {id_number(entry_price)}.")
+                        st.rerun()
 
     st.divider()
     st.markdown("**📋 Daftar Watchlist**")

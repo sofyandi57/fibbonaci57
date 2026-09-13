@@ -1181,6 +1181,90 @@ def top_accumulator_trend(code: str):
 
 
 # --------------------------------------------------------------------------
+# BPJP / BSJP -- statistik win-rate pola beli-pagi-jual-pagi & beli-sore-jual-pagi
+# --------------------------------------------------------------------------
+def bpjp_bsjp_stats(df: pd.DataFrame, window: int = 60):
+    """
+    BPJP (Beli Pagi Jual Pagi): entry di open, exit di close HARI YANG SAMA.
+    Menang kalau close > open (candle hijau intraday).
+    BSJP (Beli Sore Jual Pagi): entry di close hari ini, exit di open hari
+    BERIKUTNYA (gap overnight). Menang kalau open besok > close hari ini.
+    Statistik win-rate & rata-rata return murni historis -- BUKAN prediksi,
+    dan mengabaikan biaya transaksi/slippage.
+    """
+    seg = df.tail(window).reset_index(drop=True)
+    if len(seg) < 5:
+        return None
+
+    bpjp_ret = (seg["close"] - seg["open"]) / seg["open"] * 100
+    bpjp_win = float((bpjp_ret > 0).mean() * 100)
+    bpjp_avg = float(bpjp_ret.mean())
+
+    next_open = seg["open"].shift(-1)
+    bsjp_ret = ((next_open - seg["close"]) / seg["close"] * 100).iloc[:-1]
+    bsjp_win = float((bsjp_ret > 0).mean() * 100) if len(bsjp_ret) else None
+    bsjp_avg = float(bsjp_ret.mean()) if len(bsjp_ret) else None
+
+    return {
+        "n": len(seg),
+        "bpjp_win_rate": bpjp_win, "bpjp_avg_return": bpjp_avg,
+        "bsjp_win_rate": bsjp_win, "bsjp_avg_return": bsjp_avg,
+    }
+
+
+# --------------------------------------------------------------------------
+# KESIMPULAN GABUNGAN -- sintesis rule-based dari sinyal Teknikal +
+# Bandarmologi yang SUDAH dihitung di tab masing-masing (bukan panggilan
+# LLM terpisah per aspek ala "5 AI agent" -- di sini murni skor tertimbang
+# dari angka yang sudah ada, supaya cepat & tidak nambah beban API/token).
+# --------------------------------------------------------------------------
+def combined_verdict(sig: dict, structure: str, bdm_info: dict | None,
+                      trend_info: dict | None, binfo: dict | None):
+    """Gabungkan sinyal fib + status bandar jadi satu skor & verdict."""
+    score = 0
+    reasons = []
+
+    if structure == "UPTREND":
+        score += 1
+        reasons.append("Struktur harga UPTREND (+1)")
+    elif structure == "DOWNTREND":
+        score -= 1
+        reasons.append("Struktur harga DOWNTREND (-1)")
+
+    if sig.get("signal") in ("WEAK PULLBACK", "STRONG PULLBACK"):
+        score += 1
+        reasons.append(f"Sinyal fib: {sig['signal']} (+1)")
+
+    if bdm_info:
+        if bdm_info.get("kind") == "AKUMULASI":
+            bump = 2 if bdm_info.get("vol_breakout") else 1
+            score += bump
+            reasons.append(f"BDM {bdm_info['stage']} (+{bump})")
+        elif bdm_info.get("kind") == "DISTRIBUSI":
+            score -= 2
+            reasons.append(f"BDM {bdm_info['stage']} (-2)")
+
+    if trend_info and trend_info.get("still_active"):
+        score += 1
+        reasons.append(f"Broker {trend_info['broker']} masih aktif mengumpulkan (+1)")
+
+    if binfo and binfo.get("broker_filter_pass"):
+        score += 1
+        reasons.append("Top-3 broker terkonsentrasi & net beli semua (+1)")
+
+    if score >= 3:
+        verdict = "AKUMULASI KUAT"
+    elif score >= 1:
+        verdict = "CENDERUNG POSITIF"
+    elif score <= -2:
+        verdict = "WASPADA DISTRIBUSI"
+    else:
+        verdict = "NETRAL / DATA BELUM CUKUP"
+
+    return {"score": score, "verdict": verdict, "reasons": reasons}
+
+
+# --------------------------------------------------------------------------
 # GROQ AI
 # --------------------------------------------------------------------------
 def _groq_model_order() -> list:
@@ -1754,6 +1838,31 @@ if mode == "Analisis Satu Saham":
     retr, ext = fib_map(low_p, high_p)
     sig, _, _ = analyze_signal(df, low_p, high_p, max_risk)
 
+    # --- Data bandar dihitung sekali di sini, dipakai untuk kartu verdict
+    # gabungan DAN ditampilkan lagi di tab Bandarmologi (sudah di-cache,
+    # jadi tidak menambah panggilan API) ---
+    bdm = fetch_bdm(ticker, lookback)
+    bdm_info = bandar_classify(df, bdm) if bdm is not None and not bdm.empty else None
+    bsum = fetch_broker_summary(ticker, 20)
+    binfo = broker_top3_accumulate(bsum)
+    trend_info = top_accumulator_trend(ticker)
+
+    st.subheader("🧭 Kesimpulan Gabungan")
+    verdict = combined_verdict(sig, structure, bdm_info, trend_info, binfo)
+    vc1, vc2 = st.columns([1, 3])
+    vc1.metric("Verdict", verdict["verdict"], delta=f"skor {verdict['score']:+d}")
+    with vc2:
+        if verdict["reasons"]:
+            for r in verdict["reasons"]:
+                st.write(f"• {r}")
+        else:
+            st.caption("Belum ada faktor pendukung/pelemah yang cukup kuat terdeteksi.")
+    st.caption(
+        "Skor rule-based dari sinyal Teknikal + Bandarmologi yang sudah dihitung di "
+        "tab masing-masing di bawah — bukan rekomendasi beli/jual, dan bukan hasil "
+        "sintesis banyak model AI terpisah per aspek."
+    )
+
     tab_teknikal, tab_bandarmologi, tab_fundamental = st.tabs(
         ["📐 Teknikal", "🕵️ Bandarmologi", "📊 Fundamental"]
     )
@@ -1810,14 +1919,31 @@ if mode == "Analisis Satu Saham":
         v4.metric("Tren 10h Terakhir", vtrend)
         st.pyplot(plot_volume_30d(df), use_container_width=True)
 
+        st.subheader("🌅 BPJP / BSJP (statistik historis)")
+        st.caption(
+            "**BPJP** (Beli Pagi Jual Pagi): entry di open, exit di close hari yang "
+            "sama. **BSJP** (Beli Sore Jual Pagi): entry di close hari ini, exit di "
+            "open besok (gap overnight). Win-rate & rata-rata return murni historis "
+            "60 hari terakhir — BUKAN prediksi, mengabaikan biaya transaksi."
+        )
+        bpjp = bpjp_bsjp_stats(df)
+        if bpjp:
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric("BPJP Win-Rate", f"{bpjp['bpjp_win_rate']:.0f}%")
+            p2.metric("BPJP Avg Return", f"{bpjp['bpjp_avg_return']:+.2f}%")
+            if bpjp["bsjp_win_rate"] is not None:
+                p3.metric("BSJP Win-Rate", f"{bpjp['bsjp_win_rate']:.0f}%")
+                p4.metric("BSJP Avg Return", f"{bpjp['bsjp_avg_return']:+.2f}%")
+            st.caption(f"Sampel: {bpjp['n']} hari bursa terakhir.")
+        else:
+            st.caption("Data harga belum cukup untuk hitung statistik BPJP/BSJP.")
+
     # ======================================================================
     # TAB BANDARMOLOGI — BDM, broker, kepemilikan/insider, sentimen komunitas
     # ======================================================================
     with tab_bandarmologi:
-        bdm = fetch_bdm(ticker, lookback)
         if bdm is not None and not bdm.empty:
             st.subheader("🕵️ Aktivitas Bandar (BDM)")
-            bdm_info = bandar_classify(df, bdm)
             if bdm_info:
                 b1, b2, b3, b4 = st.columns(4)
                 b1.metric("Stage", bdm_info["stage"])
@@ -1827,8 +1953,6 @@ if mode == "Analisis Satu Saham":
             st.pyplot(plot_bandar(df, bdm), use_container_width=True)
 
         with st.expander("🏦 Top 3 Broker (net akumulasi 20 hari)"):
-            bsum = fetch_broker_summary(ticker, 20)
-            binfo = broker_top3_accumulate(bsum)
             if binfo:
                 bb1, bb2, bb3, bb4 = st.columns(4)
                 bb1.metric(f"#1 {binfo['b1']}", f"{binfo['net1']:,.0f}")
@@ -1840,7 +1964,6 @@ if mode == "Analisis Satu Saham":
                 st.caption("Data broker tidak cukup / endpoint butuh paket tertentu.")
 
         st.subheader("🧲 Bandar yang Sedang Mengumpulkan")
-        trend_info = top_accumulator_trend(ticker)
         if trend_info:
             active = trend_info["still_active"]
             t1, t2, t3 = st.columns(3)

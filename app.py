@@ -520,9 +520,19 @@ def groq_chat(prompt: str) -> str:
             "max_tokens": 900,
         },
         timeout=90,
+        allow_redirects=False,
     )
+    if r.is_redirect or r.status_code in (301, 302, 303, 307, 308):
+        return (
+            f"❌ Groq redirect ke '{r.headers.get('Location')}' — permintaan POST "
+            "berubah jadi GET dan gagal. Cek GROQ_URL sudah benar-benar "
+            "'https://api.groq.com/openai/v1/chat/completions' (huruf besar/kecil, "
+            "trailing slash)."
+        )
     if r.status_code == 401:
         return "❌ GROQ_API_KEY tidak valid."
+    if r.status_code == 404:
+        return f"❌ Groq 404: {r.text}"
     if r.status_code == 429:
         return "⏳ Rate limit Groq — coba beberapa saat lagi."
     r.raise_for_status()

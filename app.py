@@ -72,6 +72,33 @@ st.set_page_config(
     layout="wide",
 )
 
+# Ukuran font st.metric() default AUTO-SHRINK dan/atau terpotong elipsis
+# kalau isinya panjang (mis. nama sinyal "SKIP (level tidak konsisten)").
+# Kunci ukuran font tetap + izinkan wrap ke baris berikutnya, jangan
+# dipotong -- konsisten di semua metric di seluruh app.
+st.markdown(
+    """
+    <style>
+    [data-testid="stMetricValue"] {
+        font-size: 1.6rem !important;
+        white-space: normal !important;
+        overflow-wrap: break-word !important;
+        text-overflow: unset !important;
+        line-height: 1.3 !important;
+    }
+    [data-testid="stMetricLabel"] {
+        font-size: 0.85rem !important;
+        white-space: normal !important;
+    }
+    [data-testid="stMetricDelta"] {
+        font-size: 0.85rem !important;
+        white-space: normal !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # --------------------------------------------------------------------------
 # SECRETS
 # --------------------------------------------------------------------------

@@ -126,7 +126,10 @@ def _sb_upsert(table: str, rows: list):
     """Upsert baris ke Supabase. `rows` = list of dict."""
     url = f"{st.secrets['SUPABASE_URL']}/rest/v1/{table}"
     r = requests.post(url, headers=_sb_headers(), json=rows, timeout=60)
-    r.raise_for_status()
+    if not r.ok:
+        raise RuntimeError(
+            f"Supabase upsert ke '{table}' gagal ({r.status_code}): {r.text}"
+        )
 
 
 # ---------- SQLite fallback ----------

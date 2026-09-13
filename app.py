@@ -562,7 +562,6 @@ def fetch_insider_transactions(code: str, months: int = INSIDER_LOOKBACK_MONTHS)
     dengan tabel/verdict di UI.
     Return (df_or_None, error_message_or_None).
     """
-    frm = (date.today() - timedelta(days=months * 30)).isoformat()
     to = date.today().isoformat()
     key = f"{code}|insider|{months}m"
 
@@ -577,21 +576,46 @@ def fetch_insider_transactions(code: str, months: int = INSIDER_LOOKBACK_MONTHS)
 
     api_key = get_secret("INVEZGO_API_KEY")
     url = f"{BASE_URL}/analysis/shareholder-insider"
-    try:
-        r = requests.get(
-            url,
-            params={"code": code, "from": frm, "to": to, "page": 1, "limit": 100},
-            headers={"Authorization": f"Bearer {api_key}"}, timeout=30,
-        )
-    except requests.RequestException as e:
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    # Endpoint ini pernah balas 500 (server error InvezGo, bukan masalah
+    # client) untuk rentang tanggal lebar (18 bulan). Coba mundur ke
+    # rentang lebih pendek sebagai fallback sebelum menyerah -- kalau
+    # akarnya memang server timeout pada window besar, window kecil masih
+    # bisa jalan meski datanya jadi lebih sedikit dari yang diminta.
+    last_err = None
+    for try_months in sorted({months, 12, 6, 3}, reverse=True):
+        if try_months > months:
+            continue
+        frm = (date.today() - timedelta(days=try_months * 30)).isoformat()
+        try:
+            r = requests.get(
+                url,
+                params={"code": code, "from": frm, "to": to, "page": 1, "limit": 50},
+                headers=headers, timeout=30,
+            )
+        except requests.RequestException as e:
+            last_err = f"Request error: {e}"
+            continue
+        if r.status_code == 500:
+            last_err = f"GET {url} -> 500 Internal Server Error (window {try_months} bulan) | body: {r.text[:300]}"
+            continue  # coba window lebih pendek
+        if not r.ok:
+            cached = pd.read_json(io.StringIO(payload)) if payload else None
+            hint = _STATUS_HINT.get(r.status_code, f"{r.status_code}")
+            return cached, f"GET {url} -> {hint} | body: {r.text[:300]}"
+        body = r.json()
+        records = body.get("data", []) if isinstance(body, dict) else (body or [])
+        if try_months < months and records:
+            last_err = None  # berhasil dengan window dipersempit -- bukan error lagi
+        break
+    else:
         cached = pd.read_json(io.StringIO(payload)) if payload else None
-        return cached, f"Request error: {e}"
-    if not r.ok:
+        return cached, last_err or "Semua percobaan gagal."
+
+    if last_err and not records:
         cached = pd.read_json(io.StringIO(payload)) if payload else None
-        hint = _STATUS_HINT.get(r.status_code, f"{r.status_code}")
-        return cached, f"GET {url} -> {hint} | body: {r.text[:300]}"
-    body = r.json()
-    records = body.get("data", []) if isinstance(body, dict) else (body or [])
+        return cached, last_err
     if not records:
         return None, None  # tidak ada laporan insider di periode ini -- bukan error
 

@@ -496,11 +496,21 @@ SHAREHOLDER_CACHE_TTL_HOURS = 24  # komposisi kepemilikan terbit bulanan, tidak 
 INSIDER_LOOKBACK_MONTHS = 18
 
 
+_STATUS_HINT = {
+    401: "401 Unauthorized — API key tidak valid.",
+    402: "402 Payment Required — endpoint ini butuh paket/langganan lebih tinggi dari yang kamu punya.",
+    404: "404 Not Found — path endpoint kemungkinan salah/berbeda dari dokumentasi InvezGo.",
+    429: "429 Rate limited — coba lagi beberapa saat.",
+}
+
+
 def fetch_shareholders(code: str):
     """
     Komposisi pemegang saham >1% saat ini.
     Endpoint: GET /analysis/shareholder/stock/{code}.
     Cache 24 jam di kv_cache -- data ini terbit bulanan, bukan harian.
+    Return (df_or_None, error_message_or_None) -- error selalu diteruskan
+    ke UI, tidak ditelan diam-diam, supaya 402/404/401 bisa dibedakan.
     """
     key = f"{code}|shareholders"
     payload, fetched_at = db_get_kv(key)
@@ -508,37 +518,37 @@ def fetch_shareholders(code: str):
         try:
             age_hours = (_wib_now() - _dt.fromisoformat(fetched_at)).total_seconds() / 3600
             if age_hours < SHAREHOLDER_CACHE_TTL_HOURS:
-                return pd.read_json(io.StringIO(payload))
+                return pd.read_json(io.StringIO(payload)), None
         except (ValueError, TypeError):
             pass
 
     api_key = get_secret("INVEZGO_API_KEY")
+    url = f"{BASE_URL}/analysis/shareholder/stock/{code}"
     try:
-        r = requests.get(
-            f"{BASE_URL}/analysis/shareholder/stock/{code}",
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=30,
-        )
-    except requests.RequestException:
-        return pd.read_json(io.StringIO(payload)) if payload else None
-    if r.status_code in (204, 401, 402, 404, 429):
-        return pd.read_json(io.StringIO(payload)) if payload else None
-    r.raise_for_status()
+        r = requests.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=30)
+    except requests.RequestException as e:
+        cached = pd.read_json(io.StringIO(payload)) if payload else None
+        return cached, f"Request error: {e}"
+    if not r.ok:
+        cached = pd.read_json(io.StringIO(payload)) if payload else None
+        hint = _STATUS_HINT.get(r.status_code, f"{r.status_code}")
+        return cached, f"GET {url} -> {hint} | body: {r.text[:300]}"
     data = r.json()
     if not data:
-        return None
+        return None, f"GET {url} -> 200 OK tapi respons kosong."
     df = pd.DataFrame(data)
     if "percentage" in df.columns:
         df["percentage"] = pd.to_numeric(df["percentage"], errors="coerce")
         df = df.sort_values("percentage", ascending=False).reset_index(drop=True)
     db_set_kv(key, df.to_json(), _wib_now().isoformat())
-    return df
+    return df, None
 
 
 def fetch_insider_transactions(code: str, months: int = INSIDER_LOOKBACK_MONTHS):
     """
     Riwayat transaksi insider (wajib lapor >5% / direksi / komisaris).
     Endpoint: GET /analysis/insider/stock/{code}.
+    Return (df_or_None, error_message_or_None).
     """
     frm = (date.today() - timedelta(days=months * 30)).isoformat()
     to = date.today().isoformat()
@@ -549,32 +559,33 @@ def fetch_insider_transactions(code: str, months: int = INSIDER_LOOKBACK_MONTHS)
         try:
             age_hours = (_wib_now() - _dt.fromisoformat(fetched_at)).total_seconds() / 3600
             if age_hours < SHAREHOLDER_CACHE_TTL_HOURS:
-                return pd.read_json(io.StringIO(payload))
+                return pd.read_json(io.StringIO(payload)), None
         except (ValueError, TypeError):
             pass
 
     api_key = get_secret("INVEZGO_API_KEY")
+    url = f"{BASE_URL}/analysis/insider/stock/{code}"
     try:
         r = requests.get(
-            f"{BASE_URL}/analysis/insider/stock/{code}",
-            params={"from": frm, "to": to},
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=30,
+            url, params={"from": frm, "to": to},
+            headers={"Authorization": f"Bearer {api_key}"}, timeout=30,
         )
-    except requests.RequestException:
-        return pd.read_json(io.StringIO(payload)) if payload else None
-    if r.status_code in (204, 401, 402, 404, 429):
-        return pd.read_json(io.StringIO(payload)) if payload else None
-    r.raise_for_status()
+    except requests.RequestException as e:
+        cached = pd.read_json(io.StringIO(payload)) if payload else None
+        return cached, f"Request error: {e}"
+    if not r.ok:
+        cached = pd.read_json(io.StringIO(payload)) if payload else None
+        hint = _STATUS_HINT.get(r.status_code, f"{r.status_code}")
+        return cached, f"GET {url} -> {hint} | body: {r.text[:300]}"
     data = r.json()
     if not data:
-        return None
+        return None, None  # 200 OK, memang tidak ada laporan insider -- bukan error
     df = pd.DataFrame(data)
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"]).dt.date
         df = df.sort_values("date", ascending=False).reset_index(drop=True)
     db_set_kv(key, df.to_json(), _wib_now().isoformat())
-    return df
+    return df, None
 
 
 def insider_verdict(insider_df: pd.DataFrame, days: int = 90):
@@ -1280,19 +1291,21 @@ if mode == "Analisis Satu Saham":
 
     with sh_col:
         st.markdown("**Komposisi Pemegang Saham (>1%)**")
-        shareholders = fetch_shareholders(ticker)
+        shareholders, sh_err = fetch_shareholders(ticker)
         if shareholders is not None and not shareholders.empty:
             show_cols = [c for c in ["name", "percentage", "shares", "type"] if c in shareholders.columns]
             st.dataframe(
                 shareholders[show_cols] if show_cols else shareholders,
                 use_container_width=True, hide_index=True, height=280,
             )
+        elif sh_err:
+            st.error(f"❌ Shareholder gagal diambil: {sh_err}")
         else:
-            st.caption("Data shareholder tidak tersedia / endpoint butuh paket tertentu.")
+            st.caption("Tidak ada data shareholder untuk ticker ini.")
 
     with ins_col:
         st.markdown(f"**Transaksi Insider ({INSIDER_LOOKBACK_MONTHS} bulan terakhir)**")
-        insider_df = fetch_insider_transactions(ticker)
+        insider_df, ins_err = fetch_insider_transactions(ticker)
         if insider_df is not None and not insider_df.empty:
             verdict = insider_verdict(insider_df)
             if verdict and verdict["count"] > 0:
@@ -1305,8 +1318,10 @@ if mode == "Analisis Satu Saham":
                 insider_df[show_cols] if show_cols else insider_df,
                 use_container_width=True, hide_index=True, height=230,
             )
+        elif ins_err:
+            st.error(f"❌ Insider gagal diambil: {ins_err}")
         else:
-            st.caption("Tidak ada laporan insider dalam periode ini / endpoint butuh paket tertentu.")
+            st.caption("Tidak ada laporan insider dalam periode ini.")
 
     # --- Analisis AI (Groq) ---
     st.subheader("🤖 Analisis AI (Groq)")

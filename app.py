@@ -991,20 +991,120 @@ def fetch_ng_daily_summary(code: str, day: date):
     return fetch_daily_broker_summary(code, day, market="NG")
 
 
-def broker_top3_concentration(summary: pd.DataFrame):
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_inventory_chart_stock(code: str, days: int = 35, market: str = "RG", limit: int = 20):
     """
-    Konsentrasi 3 broker TERBESAR (by buy_volume) sebagai persentase dari
-    total volume beli hari itu -- metrik "Top Broker Concentration %" ala
-    FlowTracker Flow Analyzer. BEDA dari broker_top3_accumulate(): itu
-    filter net beli-jual multi-hari, ini murni pangsa volume SATU hari.
+    Net value HARIAN per broker untuk satu saham, dalam SATU panggilan API
+    (bukan loop per hari) -- endpoint: GET /analysis/inventory-chart/stock/{code}.
+    Return dict {"price": [...], "broker": [{"broker": code, "data": [{date, value}]}]}
+    atau None. `value` = net value (buy_value - sell_value) harian broker itu.
     """
-    if summary is None or summary.empty or "buy_volume" not in summary.columns:
+    frm = (date.today() - timedelta(days=days)).isoformat()
+    to = date.today().isoformat()
+    api_key = get_secret("INVEZGO_API_KEY")
+    try:
+        r = requests.get(
+            f"{BASE_URL}/analysis/inventory-chart/stock/{code}",
+            params={"from": frm, "to": to, "scope": "val", "investor": "all",
+                    "market": market, "limit": limit},
+            headers={"Authorization": f"Bearer {api_key}"}, timeout=30,
+        )
+    except requests.RequestException:
         return None
-    total = float(summary["buy_volume"].sum())
-    if total <= 0:
+    if not r.ok:
         return None
-    top3_sum = float(summary.nlargest(3, "buy_volume")["buy_volume"].sum())
-    return top3_sum / total * 100
+    data = r.json()
+    if not data or not data.get("broker"):
+        return None
+    return data
+
+
+def inventory_to_frames(data: dict):
+    """Ubah respons inventory-chart/stock jadi (price_df, net_pivot_df) -- net_pivot: index=broker, columns=date."""
+    price_df = pd.DataFrame(data.get("price", []))
+    if not price_df.empty:
+        price_df["date"] = pd.to_datetime(price_df["date"]).dt.date
+        for col in ["open", "high", "low", "close", "volume"]:
+            if col in price_df.columns:
+                price_df[col] = pd.to_numeric(price_df[col], errors="coerce")
+
+    records = {}
+    for b in data.get("broker", []):
+        vals = {}
+        for pt in b.get("data", []):
+            d = pd.to_datetime(pt["date"]).date()
+            vals[d] = float(pt.get("value") or 0)
+        records[b["broker"]] = vals
+    net_pivot = pd.DataFrame.from_dict(records, orient="index")
+    net_pivot = net_pivot.reindex(sorted(net_pivot.columns), axis=1)
+    return price_df, net_pivot
+
+
+def broker_top3_concentration_signed(net_pivot: pd.DataFrame, day) -> float | None:
+    """
+    Konsentrasi TERTANDA (bisa negatif) ala FlowTracker Flow Analyzer:
+    (jumlah net value 3 broker dengan |net| terbesar hari itu) / (total
+    |net value| semua broker hari itu) x 100. Positif = net beli
+    mendominasi, negatif = net jual mendominasi -- BEDA dari
+    broker_top3_accumulate() yang filter net beli-jual multi-hari.
+    """
+    if net_pivot is None or net_pivot.empty or day not in net_pivot.columns:
+        return None
+    col = net_pivot[day].dropna()
+    if col.empty:
+        return None
+    total_abs = col.abs().sum()
+    if total_abs <= 0:
+        return None
+    top3 = col.reindex(col.abs().sort_values(ascending=False).index).head(3)
+    return float(top3.sum()) / float(total_abs) * 100
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_broker_list():
+    """Daftar kode broker + nama sekuritas. Endpoint: GET /analysis/list/broker."""
+    api_key = get_secret("INVEZGO_API_KEY")
+    try:
+        r = requests.get(f"{BASE_URL}/analysis/list/broker",
+                          headers={"Authorization": f"Bearer {api_key}"}, timeout=30)
+    except requests.RequestException:
+        return []
+    if not r.ok:
+        return []
+    return r.json() or []
+
+
+def fetch_broker_activity(broker_code: str, days: int = 30, market: str = "RG"):
+    """
+    Aktivitas satu broker di SEMUA saham yang dia transaksikan -- kebalikan
+    arah dari fitur lain (mulai dari broker, bukan dari saham). Endpoint:
+    GET /analysis/summary/broker/{code} -- return per-saham buy/sell/net.
+    Return (df_or_None, error_message_or_None).
+    """
+    frm = (date.today() - timedelta(days=days)).isoformat()
+    to = date.today().isoformat()
+    api_key = get_secret("INVEZGO_API_KEY")
+    url = f"{BASE_URL}/analysis/summary/broker/{broker_code}"
+    try:
+        r = requests.get(
+            url, params={"from": frm, "to": to, "investor": "all", "market": market},
+            headers={"Authorization": f"Bearer {api_key}"}, timeout=30,
+        )
+    except requests.RequestException as e:
+        return None, f"Request error: {e}"
+    if r.status_code == 204:
+        return None, None
+    if not r.ok:
+        hint = _STATUS_HINT.get(r.status_code, f"{r.status_code}")
+        return None, f"GET {url} -> {hint} | body: {r.text[:300]}"
+    data = r.json()
+    if not data:
+        return None, None
+    df = pd.DataFrame(data)
+    for col in ["buy_value", "sell_value", "net_value", "buy_volume", "sell_volume", "net_volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    return df, None
 
 
 def reconcile_insider_to_broker(code: str, insider_df: pd.DataFrame, tolerance: float = 0.05):
@@ -1829,30 +1929,107 @@ def bandar_analysis(code: str, lookback: int):
 FLOW_ANALYZER_DAYS = 5
 
 
-def flow_analyzer_row(code: str, lookback: int = 30):
-    """Satu baris Flow Analyzer untuk satu ticker: harga, chg harian, konsentrasi D-4..D0."""
+def flow_analyzer_row(code: str, lookback: int = 15):
+    """
+    Satu baris Flow Analyzer: harga, chg harian, konsentrasi TERTANDA
+    D-4..D0. Dihitung dari SATU panggilan inventory-chart/stock (bukan 5
+    panggilan per-hari seperti versi awal) -- lebih hemat kuota & lebih
+    akurat merepresentasikan pola FlowTracker asli yang nilainya bisa
+    negatif (net jual mendominasi) maupun positif (net beli mendominasi).
+    """
     df = fetch_daily_chart(code, lookback)
     if df is None or len(df) < FLOW_ANALYZER_DAYS + 1:
         return None
 
-    last_n = df.tail(FLOW_ANALYZER_DAYS).reset_index(drop=True)
-    concentrations = []
-    last_val = None
-    for i, row in last_n.iterrows():
-        summary = fetch_daily_broker_summary(code, row["date"], market="RG")
-        concentrations.append(broker_top3_concentration(summary))
-        if i == len(last_n) - 1 and summary is not None and not summary.empty and "buy_value" in summary.columns:
-            last_val = float(pd.to_numeric(summary["buy_value"], errors="coerce").sum())
+    inv = fetch_inventory_chart_stock(code, days=lookback)
+    if inv is None:
+        return None
+    _, net_pivot = inventory_to_frames(inv)
+    if net_pivot.empty:
+        return None
+
+    last_dates = df["date"].tail(FLOW_ANALYZER_DAYS).tolist()
+    concentrations = [broker_top3_concentration_signed(net_pivot, d) for d in last_dates]
 
     price = float(df["close"].iloc[-1])
     prev_price = float(df["close"].iloc[-2])
     daily_chg = (price - prev_price) / prev_price * 100 if prev_price else 0.0
+    last_val = price * float(df["volume"].iloc[-1])  # aproksimasi nilai transaksi harian (close x volume)
 
     row = {"code": code, "last_val": last_val, "price": price, "daily_chg": daily_chg}
     labels = [f"d{FLOW_ANALYZER_DAYS - 1 - i}" for i in range(FLOW_ANALYZER_DAYS)]  # d4,d3,d2,d1,d0
     for label, conc in zip(labels, concentrations):
         row[label] = conc
     return row
+
+
+# --------------------------------------------------------------------------
+# ACCUMULATION STREAK -- broker yang SAMA jadi top net-buyer beberapa hari
+# berturut-turut (2-5 hari), porting fitur #2 FlowTracker.
+# --------------------------------------------------------------------------
+def accumulation_streak_row(code: str, streak_days: int = 2, lookback: int = 20):
+    """
+    Cek apakah ada satu broker yang jadi net-buyer TERBESAR untuk saham ini
+    di setiap hari dalam `streak_days` hari terakhir secara berturut-turut.
+    Kalau ya, hitung agregat B.Val/B.Avg broker itu + Top Seller hari
+    terakhir untuk pembanding, ala tabel Accumulation Streak FlowTracker.
+    """
+    df = fetch_daily_chart(code, lookback)
+    if df is None or len(df) < streak_days:
+        return None
+
+    inv = fetch_inventory_chart_stock(code, days=lookback)
+    if inv is None:
+        return None
+    _, net_pivot = inventory_to_frames(inv)
+    if net_pivot.empty:
+        return None
+
+    last_dates = df["date"].tail(streak_days).tolist()
+    top_buyers = []
+    for d in last_dates:
+        if d not in net_pivot.columns:
+            return None
+        col = net_pivot[d].dropna()
+        positive = col[col > 0]
+        if positive.empty:
+            return None
+        top_buyers.append(positive.idxmax())
+
+    if len(set(top_buyers)) != 1:
+        return None  # bukan broker yang sama tiap hari -> bukan streak
+    broker = top_buyers[0]
+
+    # Agregat B.Val/B.Avg broker itu selama streak, dari daily broker summary
+    # (cuma dipanggil untuk ticker yang SUDAH lolos filter streak, bukan
+    # semua ticker yang discan -- jaga kuota API tetap proporsional ke hasil).
+    total_buy_val, total_buy_vol = 0.0, 0.0
+    for d in last_dates:
+        summary = fetch_daily_broker_summary(code, d, market="RG")
+        if summary is None or summary.empty or "code" not in summary.columns:
+            continue
+        match = summary[summary["code"] == broker]
+        if not match.empty and "buy_value" in match.columns and "buy_volume" in match.columns:
+            total_buy_val += float(pd.to_numeric(match["buy_value"], errors="coerce").fillna(0).iloc[0])
+            total_buy_vol += float(pd.to_numeric(match["buy_volume"], errors="coerce").fillna(0).iloc[0])
+    b_avg = (total_buy_val / total_buy_vol) if total_buy_vol > 0 else None
+
+    price = float(df["close"].iloc[-1])
+    gain_pct = ((price - b_avg) / b_avg * 100) if b_avg else None
+
+    top_seller, s_val, s_avg = None, None, None
+    last_summary = fetch_daily_broker_summary(code, last_dates[-1], market="RG")
+    if last_summary is not None and not last_summary.empty and "sell_value" in last_summary.columns:
+        seller_row = last_summary.nlargest(1, "sell_value").iloc[0]
+        top_seller = str(seller_row.get("code"))
+        s_val = float(seller_row.get("sell_value", 0))
+        s_avg = float(seller_row.get("sell_avg", 0)) if "sell_avg" in seller_row else None
+
+    return {
+        "code": code, "price": price, "nilai": total_buy_val,
+        "top_buy": broker, "b_val": total_buy_val, "b_avg": b_avg, "gain_pct": gain_pct,
+        "top_sell": top_seller, "s_val": s_val, "s_avg": s_avg,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -1939,6 +2116,71 @@ def plot_shareholder_relation(relation_data: dict, root_code: str):
 
 
 # --------------------------------------------------------------------------
+# BROKER TREND HEATMAP + INVENTORY FLOW -- porting drill-down FlowTracker
+# ("Broker Trend" & "Broker Tracker/Inventory Flow") dari SATU panggilan
+# inventory-chart/stock yang sama dipakai Flow Analyzer & Accum. Streak.
+# --------------------------------------------------------------------------
+def plot_broker_trend_heatmap(net_pivot: pd.DataFrame, top_n: int = 15):
+    """Heatmap broker x tanggal, hijau=akumulasi/merah=distribusi/abu=netral."""
+    if net_pivot.empty:
+        return None
+    magnitude = net_pivot.abs().sum(axis=1).sort_values(ascending=False)
+    top_brokers = magnitude.head(top_n).index
+    mat = net_pivot.loc[top_brokers]
+
+    fig, ax = plt.subplots(figsize=(12, max(4, 0.35 * len(top_brokers))))
+    vmax = mat.abs().max().max() or 1
+    im = ax.imshow(mat.values, aspect="auto", cmap="RdYlGn", vmin=-vmax, vmax=vmax)
+    ax.set_yticks(range(len(mat.index)))
+    ax.set_yticklabels(mat.index, fontsize=8)
+    ax.set_xticks(range(len(mat.columns)))
+    ax.set_xticklabels([d.strftime("%d/%m") for d in mat.columns], rotation=90, fontsize=7)
+    ax.set_title(f"Broker Trend Heatmap — Top {len(top_brokers)} Broker by Net Value")
+    fig.colorbar(im, ax=ax, label="Net Value (hijau=akumulasi, merah=distribusi)")
+    fig.tight_layout()
+    return fig
+
+
+def inventory_flow_summary(net_pivot: pd.DataFrame, price_df: pd.DataFrame, broker: str):
+    """
+    Estimasi avg cost & status exit untuk satu broker, dari net value harian
+    + harga close harian -- BUKAN harga transaksi asli per broker (endpoint
+    tidak menyediakan itu), jadi ini APROKSIMASI: avg cost dihitung sebagai
+    rata-rata close tertimbang net-beli pada hari-hari net positif saja.
+    """
+    if broker not in net_pivot.index or price_df.empty:
+        return None
+    series = net_pivot.loc[broker].dropna()
+    if series.empty:
+        return None
+
+    price_by_date = price_df.set_index("date")["close"]
+    buy_days = series[series > 0]
+    if buy_days.empty:
+        return None
+    weights = buy_days.reindex(buy_days.index).values
+    prices = [price_by_date.get(d) for d in buy_days.index]
+    valid = [(w, p) for w, p in zip(weights, prices) if p is not None and pd.notna(p)]
+    if not valid:
+        return None
+    avg_cost = sum(w * p for w, p in valid) / sum(w for w, _ in valid)
+
+    cumulative = series.cumsum()
+    peak = cumulative.max()
+    current = cumulative.iloc[-1]
+    exit_pct = ((peak - current) / peak * 100) if peak > 0 else 0.0
+
+    current_price = float(price_df["close"].iloc[-1])
+    unrealized_pl_pct = (current_price - avg_cost) / avg_cost * 100 if avg_cost else None
+
+    return {
+        "broker": broker, "avg_cost": avg_cost, "exit_pct": exit_pct,
+        "cumulative_net": float(current), "peak_net": float(peak),
+        "unrealized_pl_pct": unrealized_pl_pct,
+    }
+
+
+# --------------------------------------------------------------------------
 # UI
 # --------------------------------------------------------------------------
 st.title("📈 Yandi Screener")
@@ -1952,7 +2194,8 @@ with st.sidebar:
     st.header("⚙️ Pengaturan")
     mode = st.radio(
         "Mode",
-        ["Analisis Satu Saham", "Screener Multi-Saham", "Screener Bandar", "Outlook Pasar"],
+        ["Analisis Satu Saham", "Screener Multi-Saham", "Screener Bandar",
+         "Broker Activity", "Outlook Pasar"],
     )
     lookback = st.slider("Lookback (hari)", 60, 365, 200)
     max_risk = st.slider("Batas risiko maksimum (%)", 3, 15, 8)
@@ -2152,6 +2395,41 @@ if mode == "Analisis Satu Saham":
                            delta="LOLOS" if binfo["broker_filter_pass"] else "GAGAL")
             else:
                 st.caption("Data broker tidak cukup / endpoint butuh paket tertentu.")
+
+        st.subheader("🌡️ Broker Trend Heatmap & Inventory Flow")
+        st.caption(
+            "Porting drill-down 'Broker Trend' & 'Broker Tracker' FlowTracker: "
+            "heatmap net value harian per broker 30 hari terakhir (hijau=net "
+            "beli, merah=net jual), plus estimasi harga rata-rata masuk & "
+            "status exit broker akumulator terbesar."
+        )
+        inv_data = fetch_inventory_chart_stock(ticker, days=35)
+        if inv_data:
+            price_df, net_pivot = inventory_to_frames(inv_data)
+            if not net_pivot.empty:
+                st.pyplot(plot_broker_trend_heatmap(net_pivot), use_container_width=True)
+
+                magnitude = net_pivot.sum(axis=1).sort_values(ascending=False)
+                top_accum_broker = magnitude.index[0] if not magnitude.empty else None
+                if top_accum_broker:
+                    flow_info = inventory_flow_summary(net_pivot, price_df, top_accum_broker)
+                    if flow_info:
+                        st.markdown(f"**Inventory Flow — Broker Akumulator Terbesar: {top_accum_broker}**")
+                        f1, f2, f3, f4 = st.columns(4)
+                        f1.metric("Estimasi Avg Cost", id_number(flow_info["avg_cost"], 2))
+                        f2.metric("Exit % (dari puncak)", f"{flow_info['exit_pct']:.1f}%")
+                        f3.metric("Net Kumulatif", id_number(flow_info["cumulative_net"]))
+                        pl = flow_info["unrealized_pl_pct"]
+                        f4.metric("Unrealized P/L", f"{pl:+.2f}%" if pl is not None else "-")
+                        st.caption(
+                            "⚠️ Avg cost & P/L adalah ESTIMASI (rata-rata close tertimbang "
+                            "net-beli harian), BUKAN harga transaksi riil broker — endpoint "
+                            "tidak menyediakan average price per transaksi per broker."
+                        )
+            else:
+                st.caption("Data inventory broker tidak cukup untuk membuat heatmap.")
+        else:
+            st.caption("Data inventory broker tidak tersedia / endpoint butuh paket tertentu.")
 
         st.subheader("🧲 Bandar yang Sedang Mengumpulkan")
         if trend_info:
@@ -2554,17 +2832,20 @@ elif mode == "Screener Bandar":
 
     tickers = tickers[:max_stocks]
 
-    tab_flow, tab_bdm = st.tabs(["📊 Flow Analyzer", "🕵️ BDM Akumulasi/Distribusi"])
+    tab_flow, tab_streak, tab_bdm = st.tabs(
+        ["📊 Flow Analyzer", "🔥 Accumulation Streak", "🕵️ BDM Akumulasi/Distribusi"]
+    )
 
     # ======================================================================
     # TAB FLOW ANALYZER — porting FlowTracker: konsentrasi top-3 broker/hari
     # ======================================================================
     with tab_flow:
         st.caption(
-            "**Top Broker Concentration %** = pangsa volume beli 3 broker "
-            "terbesar terhadap total volume beli hari itu, per market RG. "
-            "Kolom D-4..D0 = 5 hari bursa terakhir, diurutkan menurun "
-            "berdasarkan D0 (paling terkonsentrasi hari ini di atas)."
+            "**Top Broker Concentration %** (bisa negatif) = kontribusi net "
+            "value 3 broker dengan |net| terbesar hari itu, dibagi total "
+            "|net value| semua broker hari itu. Positif = net beli "
+            "mendominasi, negatif = net jual mendominasi. Kolom D-4..D0 = 5 "
+            "hari bursa terakhir, diurutkan menurun berdasarkan D0."
         )
         view_limit = st.selectbox("View limit", [10, 50, 100], index=0, key="flow_view_limit")
 
@@ -2609,6 +2890,67 @@ elif mode == "Screener Bandar":
                 file_name=f"flow_analyzer_{date.today().isoformat()}.csv",
                 mime="text/csv",
             )
+
+    # ======================================================================
+    # TAB ACCUMULATION STREAK — broker sama jadi top-buyer N hari berturut
+    # ======================================================================
+    with tab_streak:
+        st.caption(
+            "Mendeteksi broker yang jadi **net-buyer terbesar untuk saham yang "
+            "sama, N hari bursa berturut-turut** — pola akumulasi diam-diam "
+            "yang biasa dilakukan investor besar. B.Avg/S.Avg dihitung dari "
+            "agregat buy/sell_value ÷ volume broker itu selama streak, HANYA "
+            "untuk ticker yang sudah lolos filter (bukan semua ticker discan)."
+        )
+        streak_days = st.selectbox("Panjang streak (hari)", [2, 3, 4, 5], index=0, key="streak_days")
+
+        if st.button("▶️ Jalankan Accumulation Streak", type="primary"):
+            streak_rows, streak_errors = [], 0
+            prog = st.progress(0, text="Memulai Accumulation Streak…")
+            for i, code in enumerate(tickers):
+                prog.progress((i + 1) / len(tickers), text=f"Scan {code} ({i+1}/{len(tickers)})…")
+                try:
+                    row = accumulation_streak_row(code, streak_days)
+                    if row:
+                        streak_rows.append(row)
+                except Exception:
+                    streak_errors += 1
+            prog.empty()
+            st.session_state["streak_rows"] = streak_rows
+            st.session_state["streak_errors"] = streak_errors
+            st.session_state["streak_days_used"] = streak_days
+
+        if "streak_rows" not in st.session_state or not st.session_state["streak_rows"]:
+            st.info("Klik **▶️ Jalankan Accumulation Streak** untuk memulai.")
+        else:
+            streak_rows = st.session_state["streak_rows"]
+            streak_errors = st.session_state.get("streak_errors", 0)
+            streak_res = pd.DataFrame(streak_rows)
+            st.success(
+                f"Scan selesai: {len(streak_res)} saham dengan streak "
+                f"{st.session_state.get('streak_days_used', streak_days)} hari, {streak_errors} error."
+            )
+            if streak_res.empty:
+                st.caption("Tidak ada ticker dengan broker net-buyer konsisten pada panjang streak ini.")
+            else:
+                disp = streak_res.copy()
+                disp["price"] = disp["price"].apply(id_number)
+                disp["b_val"] = disp["b_val"].apply(id_number)
+                disp["b_avg"] = disp["b_avg"].apply(lambda v: id_number(v) if v else "-")
+                disp["gain_pct"] = disp["gain_pct"].apply(lambda v: f"{v:+.2f}%" if v is not None else "-")
+                disp["s_val"] = disp["s_val"].apply(lambda v: id_number(v) if v else "-")
+                disp["s_avg"] = disp["s_avg"].apply(lambda v: id_number(v) if v else "-")
+                disp = disp.rename(columns={
+                    "code": "Kode", "price": "Harga", "top_buy": "Top Buy", "b_val": "B.Val",
+                    "b_avg": "B.Avg", "gain_pct": "Gain%", "top_sell": "Top Sell",
+                    "s_val": "S.Val", "s_avg": "S.Avg",
+                })[["Kode", "Harga", "Top Buy", "B.Val", "B.Avg", "Gain%", "Top Sell", "S.Val", "S.Avg"]]
+                st.dataframe(disp, use_container_width=True, hide_index=True)
+                st.caption(
+                    "Gain% = posisi untung/rugi mengambang Top Buyer dari harga rata-rata "
+                    "belinya vs harga terakhir — indikator biaya masuk smart money, "
+                    "BUKAN sinyal beli/jual."
+                )
 
     # ======================================================================
     # TAB BDM AKUMULASI/DISTRIBUSI — logika lama, tidak berubah
@@ -2739,7 +3081,98 @@ elif mode == "Screener Bandar":
                         st.error(f"Groq error: {e}")
 
 # ==========================================================================
-# MODE 4 — OUTLOOK PASAR (IHSG, rotasi sektor, notasi khusus market-wide)
+# MODE 4 — BROKER ACTIVITY (BROKER STALKER) -- porting fitur #4 FlowTracker
+# ==========================================================================
+elif mode == "Broker Activity":
+    st.subheader("🕶️ Broker Activity (Broker Stalker)")
+    st.caption(
+        "Kebalikan arah dari mode lain: mulai dari SATU broker, lihat semua "
+        "saham yang dia transaksikan dalam rentang tanggal — ala fitur "
+        "'Run Stalker' FlowTracker. Data resmi bursa via endpoint summary "
+        "per-broker (satu panggilan API untuk semua saham broker itu)."
+    )
+
+    brokers = fetch_broker_list()
+    if not brokers:
+        st.error("Gagal ambil daftar broker — cek API key / paket langganan.")
+        st.stop()
+    broker_options = {f"{b['code']} — {b['name']}": b["code"] for b in brokers}
+
+    bc1, bc2, bc3 = st.columns([2, 1, 1])
+    broker_label = bc1.selectbox("Pilih Broker/Sekuritas", sorted(broker_options.keys()))
+    broker_code = broker_options[broker_label]
+    stalk_days = bc2.slider("Rentang hari", 5, 90, 30)
+    market_choice = bc3.selectbox("Market", ["RG", "NG", "TN"], index=0)
+
+    if st.button("▶️ Run Stalker", type="primary"):
+        activity_df, activity_err = fetch_broker_activity(broker_code, stalk_days, market_choice)
+        st.session_state["broker_activity_df"] = activity_df
+        st.session_state["broker_activity_err"] = activity_err
+        st.session_state["broker_activity_label"] = broker_label
+
+    if "broker_activity_df" not in st.session_state:
+        st.info("Pilih broker lalu klik **▶️ Run Stalker**.")
+        st.stop()
+
+    activity_df = st.session_state["broker_activity_df"]
+    activity_err = st.session_state.get("broker_activity_err")
+
+    if activity_err:
+        st.error(f"❌ Gagal mengambil aktivitas broker: {activity_err}")
+        st.stop()
+    if activity_df is None or activity_df.empty:
+        st.caption(f"Tidak ada aktivitas untuk {st.session_state.get('broker_activity_label')} di rentang ini.")
+        st.stop()
+
+    st.markdown(f"### Hasil: {st.session_state.get('broker_activity_label')}")
+    total_net = float(activity_df["net_value"].sum()) if "net_value" in activity_df.columns else 0.0
+    active_tickers = int((activity_df["net_value"] != 0).sum()) if "net_value" in activity_df.columns else len(activity_df)
+    top_focus = (
+        activity_df.assign(_abs=activity_df["net_value"].abs()).nlargest(1, "_abs")["code"].iloc[0]
+        if "net_value" in activity_df.columns and not activity_df.empty else "-"
+    )
+    s1, s2, s3 = st.columns(3)
+    s1.metric("Total Net Value", id_number(total_net))
+    s2.metric("Active Tickers", active_tickers)
+    s3.metric("Top Ticker Focus", top_focus)
+
+    st.markdown("**Stalker Ledger Summary**")
+    buy_side = activity_df[activity_df["net_value"] > 0].sort_values("net_value", ascending=False)
+    sell_side = activity_df[activity_df["net_value"] < 0].sort_values("net_value", ascending=True)
+
+    ledger_col1, ledger_col2 = st.columns(2)
+    with ledger_col1:
+        st.markdown("*Buy (Emiten)*")
+        b = buy_side[["code", "net_value", "net_volume", "buy_avg"]].head(20).copy()
+        b["net_value"] = b["net_value"].apply(id_number)
+        b["net_volume"] = b["net_volume"].apply(id_number)
+        b["buy_avg"] = b["buy_avg"].apply(lambda v: id_number(v, 2))
+        b.columns = ["Emiten", "Net Val", "Net Lot", "Avg"]
+        st.dataframe(b, use_container_width=True, hide_index=True)
+    with ledger_col2:
+        st.markdown("*Sell (Emiten)*")
+        s = sell_side[["code", "net_value", "net_volume", "sell_avg"]].head(20).copy()
+        s["net_value"] = s["net_value"].apply(lambda v: id_number(abs(v)))
+        s["net_volume"] = s["net_volume"].apply(lambda v: id_number(abs(v)))
+        s["sell_avg"] = s["sell_avg"].apply(lambda v: id_number(v, 2))
+        s.columns = ["Emiten", "Net Val", "Net Lot", "Avg"]
+        st.dataframe(s, use_container_width=True, hide_index=True)
+
+    st.caption(
+        "Berguna untuk memverifikasi apakah broker tertentu sedang aktif di "
+        "banyak saham sekaligus atau fokus pada satu tema/sektor. Bukan "
+        "sinyal beli/jual."
+    )
+
+    st.download_button(
+        "⬇️ Download hasil (CSV)",
+        data=activity_df.to_csv(index=False).encode("utf-8"),
+        file_name=f"broker_activity_{broker_code}_{date.today().isoformat()}.csv",
+        mime="text/csv",
+    )
+
+# ==========================================================================
+# MODE 5 — OUTLOOK PASAR (IHSG, rotasi sektor, notasi khusus market-wide)
 # ==========================================================================
 elif mode == "Outlook Pasar":
     st.subheader("🌐 Outlook Pasar")

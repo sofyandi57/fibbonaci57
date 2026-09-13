@@ -1905,10 +1905,24 @@ def analyze_signal(df, low_p, high_p, max_risk_pct, entry_tol=0.01):
     }, retr, ext
 
 
-def full_analysis(code: str, lookback: int, max_risk: float):
+def daily_value_ok(df: pd.DataFrame, max_daily_value: float | None) -> bool:
+    """
+    True kalau nilai transaksi hari terakhir (close x volume) masih di
+    bawah/sama dengan `max_daily_value`, atau filter tidak aktif (None).
+    Dicek dari df harga yang SUDAH di-fetch -- tidak menambah panggilan API.
+    """
+    if max_daily_value is None or df is None or df.empty:
+        return True
+    daily_value = float(df["close"].iloc[-1]) * float(df["volume"].iloc[-1])
+    return daily_value <= max_daily_value
+
+
+def full_analysis(code: str, lookback: int, max_risk: float, max_daily_value: float | None = None):
     """Jalankan seluruh pipeline fib untuk satu ticker."""
     df = fetch_daily_chart(code, lookback)
     if df is None or len(df) < 30:
+        return None, None, None
+    if not daily_value_ok(df, max_daily_value):
         return None, None, None
     highs, lows = find_swings(df)
     structure, anchor = market_structure(df, highs, lows)
@@ -2003,11 +2017,13 @@ def bandar_classify(df: pd.DataFrame, bdm: pd.DataFrame):
     }
 
 
-def bandar_analysis(code: str, lookback: int):
+def bandar_analysis(code: str, lookback: int, max_daily_value: float | None = None):
     """Pipeline lengkap screener bandar untuk satu ticker."""
     need = max(lookback, SIDEWAYS_WINDOW + 5, BDM_WINDOW + 5)
     df = fetch_daily_chart(code, need)
     if df is None or len(df) < SIDEWAYS_WINDOW:
+        return None
+    if not daily_value_ok(df, max_daily_value):
         return None
     bdm = fetch_bdm(code, need)
     info = bandar_classify(df, bdm)
@@ -2026,7 +2042,7 @@ def bandar_analysis(code: str, lookback: int):
 FLOW_ANALYZER_DAYS = 5
 
 
-def flow_analyzer_row(code: str, lookback: int = 15):
+def flow_analyzer_row(code: str, lookback: int = 15, max_daily_value: float | None = None):
     """
     Satu baris Flow Analyzer: harga, chg harian, konsentrasi TERTANDA
     D-4..D0. Dihitung dari SATU panggilan inventory-chart/stock (bukan 5
@@ -2036,6 +2052,8 @@ def flow_analyzer_row(code: str, lookback: int = 15):
     """
     df = fetch_daily_chart(code, lookback)
     if df is None or len(df) < FLOW_ANALYZER_DAYS + 1:
+        return None
+    if not daily_value_ok(df, max_daily_value):
         return None
 
     inv = fetch_inventory_chart_stock(code, days=lookback)
@@ -2064,7 +2082,8 @@ def flow_analyzer_row(code: str, lookback: int = 15):
 # ACCUMULATION STREAK -- broker yang SAMA jadi top net-buyer beberapa hari
 # berturut-turut (2-5 hari), porting fitur #2 FlowTracker.
 # --------------------------------------------------------------------------
-def accumulation_streak_row(code: str, streak_days: int = 2, lookback: int = 20):
+def accumulation_streak_row(code: str, streak_days: int = 2, lookback: int = 20,
+                             max_daily_value: float | None = None):
     """
     Cek apakah ada satu broker yang jadi net-buyer TERBESAR untuk saham ini
     di setiap hari dalam `streak_days` hari terakhir secara berturut-turut.
@@ -2073,6 +2092,8 @@ def accumulation_streak_row(code: str, streak_days: int = 2, lookback: int = 20)
     """
     df = fetch_daily_chart(code, lookback)
     if df is None or len(df) < streak_days:
+        return None
+    if not daily_value_ok(df, max_daily_value):
         return None
 
     inv = fetch_inventory_chart_stock(code, days=lookback)
@@ -2416,6 +2437,19 @@ with st.sidebar:
     )
     lookback = st.slider("Lookback (hari)", 60, 365, 200)
     max_risk = st.slider("Batas risiko maksimum (%)", 3, 15, 8)
+    st.divider()
+    st.caption("Filter universe (berlaku di semua mode screener)")
+    use_value_filter = st.checkbox("Filter nilai transaksi harian", value=True)
+    value_filter_miliar = st.number_input(
+        "Maks. nilai transaksi harian (Rp Miliar)", min_value=1, max_value=1000, value=10, step=1,
+        disabled=not use_value_filter,
+    )
+    max_daily_value = (value_filter_miliar * 1_000_000_000) if use_value_filter else None
+    st.caption(
+        "Ticker dengan nilai transaksi harian (close × volume) di atas ambang "
+        "ini di-skip SEBELUM panggilan broker/BDM tambahan — dicek dari data "
+        "harga yang sudah diambil, tidak menambah kuota API."
+    )
     st.divider()
     st.caption("API key diambil dari Streamlit Secrets.")
 
@@ -3003,6 +3037,9 @@ elif mode == "Screener Multi-Saham":
 
     tickers = tickers[:max_stocks]
 
+    if max_daily_value is not None:
+        st.caption(f"🔎 Filter aktif: nilai transaksi harian ≤ Rp{value_filter_miliar} Miliar (atur di sidebar).")
+
     if st.button("▶️ Jalankan Screener", type="primary"):
         rows, errors = [], 0
         prog = st.progress(0, text="Memulai scan…")
@@ -3011,7 +3048,7 @@ elif mode == "Screener Multi-Saham":
                 (i + 1) / len(tickers), text=f"Scan {code} ({i+1}/{len(tickers)})…"
             )
             try:
-                row, _, _ = full_analysis(code, lookback, max_risk)
+                row, _, _ = full_analysis(code, lookback, max_risk, max_daily_value)
                 if row:
                     rows.append(row)
             except Exception:
@@ -3122,6 +3159,9 @@ elif mode == "Screener Bandar":
 
     tickers = tickers[:max_stocks]
 
+    if max_daily_value is not None:
+        st.caption(f"🔎 Filter aktif: nilai transaksi harian ≤ Rp{value_filter_miliar} Miliar (atur di sidebar).")
+
     tab_flow, tab_streak, tab_bdm = st.tabs(
         ["📊 Flow Analyzer", "🔥 Accumulation Streak", "🕵️ BDM Akumulasi/Distribusi"]
     )
@@ -3145,7 +3185,7 @@ elif mode == "Screener Bandar":
             for i, code in enumerate(tickers):
                 prog.progress((i + 1) / len(tickers), text=f"Scan {code} ({i+1}/{len(tickers)})…")
                 try:
-                    row = flow_analyzer_row(code)
+                    row = flow_analyzer_row(code, max_daily_value=max_daily_value)
                     if row:
                         flow_rows.append(row)
                 except Exception:
@@ -3200,7 +3240,7 @@ elif mode == "Screener Bandar":
             for i, code in enumerate(tickers):
                 prog.progress((i + 1) / len(tickers), text=f"Scan {code} ({i+1}/{len(tickers)})…")
                 try:
-                    row = accumulation_streak_row(code, streak_days)
+                    row = accumulation_streak_row(code, streak_days, max_daily_value=max_daily_value)
                     if row:
                         streak_rows.append(row)
                 except Exception:
@@ -3273,7 +3313,7 @@ elif mode == "Screener Bandar":
                     (i + 1) / len(tickers), text=f"Scan {code} ({i+1}/{len(tickers)})…"
                 )
                 try:
-                    row = bandar_analysis(code, lookback)
+                    row = bandar_analysis(code, lookback, max_daily_value)
                     if row:
                         if use_broker_filter:
                             binfo = broker_top3_accumulate(

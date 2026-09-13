@@ -84,6 +84,14 @@ def _use_supabase() -> bool:
         return False
 
 
+def _sb_base_url() -> str:
+    """SUPABASE_URL tanpa trailing slash atau '/rest/v1' (kalau ikut ditempel)."""
+    url = st.secrets["SUPABASE_URL"].rstrip("/")
+    if url.endswith("/rest/v1"):
+        url = url[: -len("/rest/v1")]
+    return url
+
+
 def _sb_headers() -> dict:
     key = st.secrets["SUPABASE_KEY"]
     return {
@@ -96,7 +104,7 @@ def _sb_headers() -> dict:
 
 def _sb_get(table: str, code: str, frm: str, to: str):
     """Baca baris dari Supabase (PostgREST). Return DataFrame atau None."""
-    url = f"{st.secrets['SUPABASE_URL']}/rest/v1/{table}"
+    url = f"{_sb_base_url()}/rest/v1/{table}"
     try:
         r = requests.get(
             url,
@@ -124,7 +132,7 @@ def _sb_get(table: str, code: str, frm: str, to: str):
 
 def _sb_upsert(table: str, rows: list):
     """Upsert baris ke Supabase. `rows` = list of dict."""
-    url = f"{st.secrets['SUPABASE_URL']}/rest/v1/{table}"
+    url = f"{_sb_base_url()}/rest/v1/{table}"
     r = requests.post(url, headers=_sb_headers(), json=rows, timeout=60)
     if not r.ok:
         raise RuntimeError(
@@ -211,7 +219,7 @@ def db_insert_candles(code: str, df: pd.DataFrame):
 def db_get_kv(key: str):
     """Return (payload_str, fetched_at_str) atau (None, None)."""
     if _use_supabase():
-        url = f"{st.secrets['SUPABASE_URL']}/rest/v1/kv_cache"
+        url = f"{_sb_base_url()}/rest/v1/kv_cache"
         r = requests.get(
             url, headers=_sb_headers(),
             params={"key": f"eq.{key}", "limit": "1"}, timeout=30,

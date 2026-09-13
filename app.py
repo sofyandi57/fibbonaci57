@@ -33,7 +33,7 @@ import streamlit as st
 # --------------------------------------------------------------------------
 BASE_URL = "https://api.invezgo.com"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL_DEFAULT = "llama-3.1-8b-instant"
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fib_cache.db")
 
 FIB_LEVELS = [0.0, 0.382, 0.5, 0.618, 0.786, 1.0]
@@ -500,11 +500,15 @@ def broker_top3_accumulate(summary: pd.DataFrame):
 @st.cache_data(ttl=1800, show_spinner="🤖 Groq sedang menganalisis…")
 def groq_chat(prompt: str) -> str:
     key = get_secret("GROQ_API_KEY")
+    try:
+        model = st.secrets.get("GROQ_MODEL", GROQ_MODEL_DEFAULT)
+    except (FileNotFoundError, KeyError):
+        model = GROQ_MODEL_DEFAULT
     r = requests.post(
         GROQ_URL,
         headers={"Authorization": f"Bearer {key}"},
         json={
-            "model": GROQ_MODEL,
+            "model": model,
             "messages": [
                 {
                     "role": "system",
@@ -533,7 +537,12 @@ def groq_chat(prompt: str) -> str:
     if r.status_code == 401:
         return "❌ GROQ_API_KEY tidak valid."
     if r.status_code == 404:
-        return f"❌ Groq 404: {r.text}"
+        return (
+            f"❌ Groq 404 ({model}): {r.text}\n\n"
+            "Model ini mungkin sudah tidak tersedia. Cek daftar model aktif di "
+            "https://console.groq.com/docs/models, lalu set `GROQ_MODEL` di "
+            "Streamlit Secrets ke model yang tersedia untuk akunmu."
+        )
     if r.status_code == 429:
         return "⏳ Rate limit Groq — coba beberapa saat lagi."
     r.raise_for_status()

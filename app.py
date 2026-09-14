@@ -305,9 +305,13 @@ def db_set_kv(key: str, payload: str, fetched_at: str):
 
 # ---------- dispatcher: watchlist ----------
 def watchlist_add(code: str, entry_price: float, target_price: float | None,
-                   stop_loss: float | None, notes: str = ""):
-    """Return error_message_or_None -- ditampilkan ke UI, tidak ditelan raise_for_status()."""
-    added_at = _wib_now().isoformat()
+                   stop_loss: float | None, notes: str = "", added_at: str | None = None):
+    """
+    Return error_message_or_None -- ditampilkan ke UI, tidak ditelan raise_for_status().
+    added_at: ISO datetime tanggal/jam beli/entry -- default sekarang kalau
+    tidak diisi (mis. dipanggil dari tempat lain yang belum kasih tanggal).
+    """
+    added_at = added_at or _wib_now().isoformat()
     if _use_supabase():
         url = f"{_sb_base_url()}/rest/v1/watchlist"
         row = {"code": code, "added_at": added_at, "entry_price": entry_price,
@@ -3909,10 +3913,18 @@ elif mode == "⭐ Watchlist":
 
     with st.form("watchlist_add_form", clear_on_submit=True):
         st.markdown("**➕ Tambah ke Watchlist**")
-        wc1, wc2, wc3 = st.columns(3)
+        wc1, wc2, wc3, wc4 = st.columns(4)
         wl_ticker = wc1.text_input("Kode Saham").upper().strip()
-        wl_target = wc2.number_input("Target Harga", min_value=0.0, step=1.0, format="%.2f")
-        wl_sl = wc3.number_input("Target Stop Loss", min_value=0.0, step=1.0, format="%.2f")
+        wl_entry = wc2.number_input(
+            "Harga Entry", min_value=0.0, step=1.0, format="%.2f",
+            help="Kosongkan (0) untuk pakai harga penutupan terakhir. Isi manual "
+                 "kalau kamu sudah beli di harga lain sebelumnya.",
+        )
+        wl_target = wc3.number_input("Target Harga", min_value=0.0, step=1.0, format="%.2f")
+        wl_sl = wc4.number_input("Target Stop Loss", min_value=0.0, step=1.0, format="%.2f")
+        wc5, wc6 = st.columns(2)
+        wl_date = wc5.date_input("Tanggal Beli/Entry", value=date.today())
+        wl_time = wc6.time_input("Jam", value=_wib_now().time())
         wl_notes = st.text_area("Catatan (opsional)", height=60)
         submitted = st.form_submit_button("Tambahkan", type="primary")
 
@@ -3920,22 +3932,26 @@ elif mode == "⭐ Watchlist":
             if not wl_ticker:
                 st.warning("Kode saham wajib diisi.")
             else:
-                df_wl = fetch_daily_chart(wl_ticker, 10)
-                if df_wl is None or df_wl.empty:
-                    st.error(f"Gagal ambil harga {wl_ticker} — cek kode saham / API key.")
-                else:
+                entry_price = wl_entry if wl_entry > 0 else None
+                if entry_price is None:
+                    df_wl = fetch_daily_chart(wl_ticker, 10)
+                    if df_wl is None or df_wl.empty:
+                        st.error(f"Gagal ambil harga {wl_ticker} — cek kode saham / API key, "
+                                 "atau isi Harga Entry manual.")
+                        st.stop()
                     entry_price = float(df_wl["close"].iloc[-1])
-                    add_err = watchlist_add(
-                        wl_ticker, entry_price,
-                        wl_target if wl_target > 0 else None,
-                        wl_sl if wl_sl > 0 else None,
-                        wl_notes,
-                    )
-                    if add_err:
-                        st.error(f"❌ Gagal simpan ke watchlist: {add_err}")
-                    else:
-                        st.success(f"{wl_ticker} ditambahkan ke watchlist @ {id_number(entry_price)}.")
-                        st.rerun()
+                added_at = _dt.combine(wl_date, wl_time).isoformat()
+                add_err = watchlist_add(
+                    wl_ticker, entry_price,
+                    wl_target if wl_target > 0 else None,
+                    wl_sl if wl_sl > 0 else None,
+                    wl_notes, added_at=added_at,
+                )
+                if add_err:
+                    st.error(f"❌ Gagal simpan ke watchlist: {add_err}")
+                else:
+                    st.success(f"{wl_ticker} ditambahkan ke watchlist @ {id_number(entry_price)} ({wl_date}).")
+                    st.rerun()
 
     st.divider()
     st.markdown("**📋 Daftar Watchlist**")
